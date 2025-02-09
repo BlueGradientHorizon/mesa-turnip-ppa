@@ -23,6 +23,7 @@ sudo apt update
 sudo apt -y upgrade
 sudo apt -y full-upgrade
 sudo apt install -y software-properties-common git
+export GPG_TTY=$(tty)
 echo "${PUBKEY}" | base64 --decode | gpg --batch --import
 echo "${PRIVKEY}" | base64 --decode | gpg --batch --import --passphrase "${PASSPHRASE}"
 git config --global user.email "${EMAIL}"

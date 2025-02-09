@@ -8,7 +8,7 @@ patches=(
 	#"VK_EXT_fragment_density_map;merge_requests/29938;"
 )
 export DEBEMAIL="${EMAIL}"
-export DEBFULLNAME="MastaG"
+export DEBFULLNAME="BGHorizon"
 install_dev() {
 	if [ ! -e .devready ]
 	then
@@ -26,9 +26,9 @@ sudo apt install -y software-properties-common git
 echo "${PUBKEY}" | base64 --decode | gpg --batch --import
 echo "${PRIVKEY}" | base64 --decode | gpg --batch --import
 git config --global user.email "${EMAIL}"
-git config --global user.name "MastaG"
+git config --global user.name "BlueGradientHorizon"
 sudo add-apt-repository -n -y ppa:oibaf/graphics-drivers
-sudo add-apt-repository -n -y ppa:mastag/mesa-turnip-kgsl
+sudo add-apt-repository -n -y ppa:bghorizon/mesa-turnip-kgsl
 sudo sed -i 's/^Types: deb$/Types: deb deb-src/g' /etc/apt/sources.list.d/oibaf-*.sources
 sudo apt update
 build=()
@@ -42,7 +42,7 @@ do
 		package="libdrm2"
 	fi
 	remotever="$(apt-cache policy ${package} | grep -B1 "oibaf/graphics-drivers/ubuntu" | head -1 | sed -En 's/.* (.*git.*) .*/\1/p')"
-	ourver="$(apt-cache policy ${package} | grep -B1 "mastag/mesa-turnip-kgsl/ubuntu" | head -1 | sed -En 's/.* (.*git.*) .*/\1/p' | sed 's/-turnip-kgsl//g')"
+	ourver="$(apt-cache policy ${package} | grep -B1 "bghorizon/mesa-turnip-kgsl/ubuntu" | head -1 | sed -En 's/.* (.*git.*) .*/\1/p' | sed 's/-turnip-kgsl//g')"
 	if [ "${ourver}" == "${remotever}" ]
 	then
 		echo "${i} version in our PPA: ${ourver}"
@@ -56,7 +56,7 @@ do
 		build+=("${i}")
 	fi
 done
-sudo rm -f /etc/apt/sources.list.d/mastag-ubuntu-*
+sudo rm -f /etc/apt/sources.list.d/bghorizon-ubuntu-*
 sudo apt update
 for i in "${build[@]}"
 do
@@ -110,5 +110,5 @@ done
 if ls *.changes 1> /dev/null 2>&1
 then
 	echo "Push to launchpad"
-	dput --force ppa:mastag/mesa-turnip-kgsl *.changes
+	dput --force ppa:bghorizon/mesa-turnip-kgsl *.changes
 fi

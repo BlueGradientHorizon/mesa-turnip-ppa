@@ -24,7 +24,7 @@ sudo apt -y upgrade
 sudo apt -y full-upgrade
 sudo apt install -y software-properties-common git
 echo "${PUBKEY}" | base64 --decode | gpg --batch --import
-echo "${PRIVKEY}" | base64 --decode | gpg --batch --import
+echo "${PRIVKEY}" | base64 --decode | gpg --batch --import --passphrase "${PASSPHRASE}"
 git config --global user.email "${EMAIL}"
 git config --global user.name "BlueGradientHorizon"
 sudo add-apt-repository -n -y ppa:oibaf/graphics-drivers

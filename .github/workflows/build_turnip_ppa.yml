@@ -35,7 +35,7 @@ jobs:
           PRIVKEY: ${{ secrets.PRIVKEY }}
         run: |
           cd "$GITHUB_WORKSPACE"
-          podman build -f Dockerfile -t turnip-build --build-arg EMAIL="$EMAIL" --build-arg PRIVKEY="$PRIVKEY" --build-arg PUBKEY="$PUBKEY" --build-arg UBUNTU_VERSION="24.04"
+          podman build -f Dockerfile -t turnip-build --build-arg EMAIL="$EMAIL" --build-arg PRIVKEY="$PRIVKEY" --build-arg PUBKEY="$PUBKEY" --build-arg PASSPHRASE="$PASSPHRASE" --build-arg UBUNTU_VERSION="24.04"
           podman run --security-opt seccomp=unconfined turnip-build
 
       - name: Run build script inside podman container for 24.10
@@ -45,6 +45,6 @@ jobs:
           PRIVKEY: ${{ secrets.PRIVKEY }}
         run: |
           cd "$GITHUB_WORKSPACE"
-          podman build -f Dockerfile -t turnip-build --build-arg EMAIL="$EMAIL" --build-arg PRIVKEY="$PRIVKEY" --build-arg PUBKEY="$PUBKEY" --build-arg UBUNTU_VERSION="24.10"
+          podman build -f Dockerfile -t turnip-build --build-arg EMAIL="$EMAIL" --build-arg PRIVKEY="$PRIVKEY" --build-arg PUBKEY="$PUBKEY" --build-arg PASSPHRASE="$PASSPHRASE" --build-arg UBUNTU_VERSION="24.10"
           podman run --security-opt seccomp=unconfined turnip-build
 

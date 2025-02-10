@@ -1,0 +1,4713 @@
+Subject: [PATCH] PR 32671
+---
+Index: src/freedreno/vulkan/tu_formats.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_formats.cc b/src/freedreno/vulkan/tu_formats.cc
+--- a/src/freedreno/vulkan/tu_formats.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_formats.cc	(date 1738998728704)
+@@ -325,7 +325,7 @@
+       /* note: ubwc_possible() argument values to be ignored except for format */
+       if (pFormatProperties->formatProperties.optimalTilingFeatures &&
+           tiling_possible(format) &&
+-          ubwc_possible(NULL, format, VK_IMAGE_TYPE_2D, 0, 0,
++          ubwc_possible(NULL, format, VK_IMAGE_TYPE_2D, 0, 0, 0,
+                         physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
+                         false)) {
+          vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out, mod_props) {
+@@ -383,6 +383,10 @@
+        */
+       if (info->flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT)
+          return VK_ERROR_FORMAT_NOT_SUPPORTED;
++
++      /* Don't allow modifiers with sparse */
++      if (info->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
++         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+       switch (drm_info->drmFormatModifier) {
+       case DRM_FORMAT_MOD_QCOM_COMPRESSED:
+@@ -402,9 +406,9 @@
+                return VK_ERROR_FORMAT_NOT_SUPPORTED;
+          }
+ 
+-         if (!ubwc_possible(NULL, info->format, info->type, info->usage,
+-                            info->usage, physical_device->info, sampleCounts,
+-                            1, false)) {
++         if (!ubwc_possible(NULL, info->format, info->type, info->flags,
++                            info->usage, info->usage, physical_device->info,
++                            sampleCounts, 1, false)) {
+             return VK_ERROR_FORMAT_NOT_SUPPORTED;
+          }
+ 
+@@ -427,6 +431,35 @@
+    if (format_feature_flags == 0)
+       return tu_image_unsupported_format(pImageFormatProperties);
+ 
++   if (info->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
++      if (!physical_device->has_sparse)
++         return tu_image_unsupported_format(pImageFormatProperties);
++   }
++
++   if (info->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) {
++      /* Don't support multi-planar formats with sparse yet */
++      if (vk_format_get_plane_count(info->format) > 1)
++         return tu_image_unsupported_format(pImageFormatProperties);
++
++      /* Don't support depth/stencil with sparse yet */
++      if (vk_format_is_depth_or_stencil(info->format))
++         return tu_image_unsupported_format(pImageFormatProperties);
++
++      /* Sparse isn't compatible with HIC */
++      if (info->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT)
++         return tu_image_unsupported_format(pImageFormatProperties);
++
++       /* We can't support sparse when we force linear tiling, so disable
++        * sparse with formats or usages which could cause us to fall back to
++        * linear. We also currently don't support sparse for 3D images.
++        */
++      if (info->type != VK_IMAGE_TYPE_2D ||
++          info->tiling != VK_IMAGE_TILING_OPTIMAL ||
++          !tiling_possible(info->format) ||
++          (info->usage & VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT))
++         return tu_image_unsupported_format(pImageFormatProperties);
++   }
++
+    if (info->type != VK_IMAGE_TYPE_2D &&
+        vk_format_is_depth_or_stencil(info->format))
+       return tu_image_unsupported_format(pImageFormatProperties);
+@@ -773,6 +806,7 @@
+          (fd6_color_swap(vk_format_to_pipe_format(base_info->format),
+                                                   TILE6_LINEAR, false) == WZYX &&
+          !ubwc_possible(NULL, base_info->format, base_info->type,
++                        base_info->flags,
+                         (base_info->usage & ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT),
+                         (base_info->usage & ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT),
+                         physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
+@@ -795,14 +829,3 @@
+ 
+    return result;
+ }
+-
+-VKAPI_ATTR void VKAPI_CALL
+-tu_GetPhysicalDeviceSparseImageFormatProperties2(
+-   VkPhysicalDevice physicalDevice,
+-   const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
+-   uint32_t *pPropertyCount,
+-   VkSparseImageFormatProperties2 *pProperties)
+-{
+-   /* Sparse images are not yet supported. */
+-   *pPropertyCount = 0;
+-}
+Index: src/freedreno/vulkan/tu_image.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_image.h b/src/freedreno/vulkan/tu_image.h
+--- a/src/freedreno/vulkan/tu_image.h	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_image.h	(date 1738998728721)
+@@ -13,6 +13,8 @@
+ #include "tu_common.h"
+ #include "fdl/freedreno_lrz_layout.h"
+ 
++#include "tu_knl.h"
++
+ #define TU_MAX_PLANE_COUNT 3
+ 
+ #define tu_fdl_view_stencil(view, x) \
+@@ -35,9 +37,14 @@
+    uint64_t total_size;
+ 
+    /* Set when bound */
+-   struct tu_bo *bo;
+-   uint64_t bo_offset;
+-   uint64_t iova;
++   uint64_t iova;
++   union {
++      struct {
++         struct tu_bo *bo;
++         uint64_t bo_offset;
++      };
++      struct tu_sparse_vma vma;
++   };
+ 
+    /* For fragment density map */
+    void *map;
+@@ -115,6 +122,7 @@
+ ubwc_possible(struct tu_device *device,
+               VkFormat format,
+               VkImageType type,
++              VkImageCreateFlags flags,
+               VkImageUsageFlags usage,
+               VkImageUsageFlags stencil_usage,
+               const struct fd_dev_info *info,
+@@ -122,6 +130,13 @@
+               uint32_t mip_levels,
+               bool use_z24uint_s8uint);
+ 
++bool
++tu_is_r8g8(enum pipe_format format);
++
++bool
++tu_format_list_reinterprets_r8g8_r16(enum pipe_format format,
++                                     const VkImageFormatListCreateInfo *fmt_list);
++
+ struct tu_frag_area {
+    float width;
+    float height;
+@@ -137,4 +152,9 @@
+ tu_image_update_layout(struct tu_device *device, struct tu_image *image,
+                        uint64_t modifier, const VkSubresourceLayout *plane_layouts);
+ 
++void
++tu_bind_sparse_image(struct tu_device *device, void *submit,
++                     struct tu_image *image,
++                     const VkSparseImageMemoryBind *bind);
++
+ #endif /* TU_IMAGE_H */
+Index: src/freedreno/vulkan/tu_cmd_buffer.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc	(date 1738998728664)
+@@ -3828,6 +3828,7 @@
+ 
+    SRC_INCOHERENT_FLUSH(CCU_COLOR, CCU_CLEAN_COLOR, CCU_INVALIDATE_COLOR)
+    SRC_INCOHERENT_FLUSH(CCU_DEPTH, CCU_CLEAN_DEPTH, CCU_INVALIDATE_DEPTH)
++   SRC_INCOHERENT_FLUSH(UCHE, CACHE_CLEAN, CACHE_INVALIDATE)
+ 
+ #undef SRC_INCOHERENT_FLUSH
+ 
+@@ -3862,6 +3863,7 @@
+ 
+    DST_INCOHERENT_FLUSH(CCU_COLOR, CCU_CLEAN_COLOR, CCU_INVALIDATE_COLOR)
+    DST_INCOHERENT_FLUSH(CCU_DEPTH, CCU_CLEAN_DEPTH, CCU_INVALIDATE_DEPTH)
++   DST_INCOHERENT_FLUSH(UCHE, CACHE_CLEAN, CACHE_INVALIDATE)
+ 
+    if (dst_mask & TU_ACCESS_BINDLESS_DESCRIPTOR_READ) {
+       flush_bits |= TU_CMD_FLAG_BINDLESS_DESCRIPTOR_INVALIDATE;
+@@ -3955,7 +3957,8 @@
+ }
+ 
+ static enum tu_cmd_access_mask
+-vk2tu_access(VkAccessFlags2 flags, VkPipelineStageFlags2 stages, bool image_only, bool gmem)
++vk2tu_access(VkAccessFlags2 flags, VkPipelineStageFlags2 stages,
++             bool image_only, bool gmem, bool sparse_aliasing)
+ {
+    BITMASK_ENUM(tu_cmd_access_mask) mask = 0;
+ 
+@@ -4005,8 +4008,13 @@
+                        VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                        VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                        VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_COPY_BIT_KHR |
+-                       SHADER_STAGES))
+-       mask |= TU_ACCESS_UCHE_READ | TU_ACCESS_CCHE_READ;
++                       SHADER_STAGES)) {
++      if (sparse_aliasing)
++         mask |= TU_ACCESS_UCHE_INCOHERENT_READ;
++      else
++         mask |= TU_ACCESS_UCHE_READ;
++      mask |= TU_ACCESS_CCHE_READ;
++   }
+ 
+    if (gfx_read_access(flags, stages,
+                        VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+@@ -4026,13 +4034,20 @@
+ 
+    if (gfx_read_access(flags, stages,
+                        VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT,
+-                       SHADER_STAGES))
++                       SHADER_STAGES)) {
+        mask |= TU_ACCESS_UCHE_READ_GMEM;
++       if (sparse_aliasing)
++          mask |= TU_ACCESS_UCHE_INCOHERENT_READ;
++   }
+ 
+    if (gfx_read_access(flags, stages,
+                        VK_ACCESS_2_DESCRIPTOR_BUFFER_READ_BIT_EXT,
+                        SHADER_STAGES)) {
+-      mask |= TU_ACCESS_UCHE_READ | TU_ACCESS_BINDLESS_DESCRIPTOR_READ |
++      if (sparse_aliasing)
++         mask |= TU_ACCESS_UCHE_INCOHERENT_READ;
++      else
++         mask |= TU_ACCESS_UCHE_READ;
++      mask |= TU_ACCESS_BINDLESS_DESCRIPTOR_READ |
+               TU_ACCESS_CCHE_READ;
+    }
+ 
+@@ -4041,8 +4056,12 @@
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                         VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT,
+                         VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT |
+-                        SHADER_STAGES))
+-       mask |= TU_ACCESS_UCHE_WRITE;
++                        SHADER_STAGES)) {
++      if (sparse_aliasing)
++         mask |= TU_ACCESS_UCHE_INCOHERENT_WRITE;
++      else
++         mask |= TU_ACCESS_UCHE_WRITE;
++   }
+ 
+    if (gfx_write_access(flags, stages,
+                         VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+@@ -4106,7 +4125,7 @@
+                            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT)) {
+       if (gmem) {
+          mask |= TU_ACCESS_SYSMEM_WRITE;
+-      } else if (image_only) {
++      } else if (image_only && !sparse_aliasing) {
+          /* Because we always split up blits/copies of images involving
+           * multiple layers, we always access each layer in the same way, with
+           * the same base address, same format, etc. This means we can avoid
+@@ -4125,7 +4144,11 @@
+                           VK_PIPELINE_STAGE_2_BLIT_BIT |
+                           VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+                           VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT)) {
+-      mask |= TU_ACCESS_UCHE_READ | TU_ACCESS_CCHE_READ;
++      if (sparse_aliasing)
++         mask |= TU_ACCESS_UCHE_INCOHERENT_READ;
++      else
++         mask |= TU_ACCESS_UCHE_READ;
++      mask |= TU_ACCESS_CCHE_READ;
+    }
+ 
+    return mask;
+@@ -4567,9 +4590,11 @@
+    VkPipelineStageFlags2 dst_stage_vk =
+       sanitize_dst_stage(barrier->dst_stage_mask);
+    BITMASK_ENUM(tu_cmd_access_mask) src_flags =
+-      vk2tu_access(barrier->src_access_mask, src_stage_vk, false, false);
++      vk2tu_access(barrier->src_access_mask, src_stage_vk, false, false,
++                   cmd_buffer->device->vk.enabled_features.sparseResidencyAliased);
+    BITMASK_ENUM(tu_cmd_access_mask) dst_flags =
+-      vk2tu_access(barrier->dst_access_mask, dst_stage_vk, false, false);
++      vk2tu_access(barrier->dst_access_mask, dst_stage_vk, false, false,
++                   cmd_buffer->device->vk.enabled_features.sparseResidencyAliased);
+ 
+    if (barrier->incoherent_ccu_color)
+       src_flags |= TU_ACCESS_CCU_COLOR_INCOHERENT_WRITE;
+@@ -7214,27 +7239,39 @@
+          VkPipelineStageFlags2 sanitized_dst_stage =
+             sanitize_dst_stage(dep_info->pMemoryBarriers[i].dstStageMask);
+          src_flags |= vk2tu_access(dep_info->pMemoryBarriers[i].srcAccessMask,
+-                                   sanitized_src_stage, false, gmem);
++                                   sanitized_src_stage, false, gmem,
++                                   cmd->device->vk.enabled_features.sparseResidencyAliased);
+          dst_flags |= vk2tu_access(dep_info->pMemoryBarriers[i].dstAccessMask,
+-                                   sanitized_dst_stage, false, gmem);
++                                   sanitized_dst_stage, false, gmem,
++                                   cmd->device->vk.enabled_features.sparseResidencyAliased);
+          srcStage |= sanitized_src_stage;
+          dstStage |= sanitized_dst_stage;
+       }
+ 
+       for (uint32_t i = 0; i < dep_info->bufferMemoryBarrierCount; i++) {
++         VK_FROM_HANDLE(tu_buffer, buffer,
++                        dep_info->pBufferMemoryBarriers[i].buffer);
++         bool sparse_aliasing =
++            buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_ALIASED_BIT;
+          VkPipelineStageFlags2 sanitized_src_stage =
+             sanitize_src_stage(dep_info->pBufferMemoryBarriers[i].srcStageMask);
+          VkPipelineStageFlags2 sanitized_dst_stage =
+             sanitize_dst_stage(dep_info->pBufferMemoryBarriers[i].dstStageMask);
+          src_flags |= vk2tu_access(dep_info->pBufferMemoryBarriers[i].srcAccessMask,
+-                                   sanitized_src_stage, false, gmem);
++                                   sanitized_src_stage, false, gmem,
++                                   sparse_aliasing);
+          dst_flags |= vk2tu_access(dep_info->pBufferMemoryBarriers[i].dstAccessMask,
+-                                   sanitized_dst_stage, false, gmem);
++                                   sanitized_dst_stage, false, gmem,
++                                   sparse_aliasing);
+          srcStage |= sanitized_src_stage;
+          dstStage |= sanitized_dst_stage;
+       }
+ 
+       for (uint32_t i = 0; i < dep_info->imageMemoryBarrierCount; i++) {
++         VK_FROM_HANDLE(tu_image, image,
++                        dep_info->pImageMemoryBarriers[i].image);
++         bool sparse_aliasing =
++            image->vk.create_flags & VK_BUFFER_CREATE_SPARSE_ALIASED_BIT;
+          VkImageLayout old_layout = dep_info->pImageMemoryBarriers[i].oldLayout;
+          if (old_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+             /* The underlying memory for this image may have been used earlier
+@@ -7257,9 +7294,11 @@
+          VkPipelineStageFlags2 sanitized_dst_stage =
+             sanitize_dst_stage(dep_info->pImageMemoryBarriers[i].dstStageMask);
+          src_flags |= vk2tu_access(dep_info->pImageMemoryBarriers[i].srcAccessMask,
+-                                   sanitized_src_stage, true, gmem);
++                                   sanitized_src_stage, true, gmem,
++                                   sparse_aliasing);
+          dst_flags |= vk2tu_access(dep_info->pImageMemoryBarriers[i].dstAccessMask,
+-                                   sanitized_dst_stage, true, gmem);
++                                   sanitized_dst_stage, true, gmem,
++                                   sparse_aliasing);
+          srcStage |= sanitized_src_stage;
+          dstStage |= sanitized_dst_stage;
+       }
+Index: src/freedreno/vulkan/tu_knl_drm.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_knl_drm.h b/src/freedreno/vulkan/tu_knl_drm.h
+--- a/src/freedreno/vulkan/tu_knl_drm.h	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_knl_drm.h	(date 1738998728749)
+@@ -20,12 +20,15 @@
+                                     enum tu_bo_alloc_flags flags,
+                                     uint64_t *iova);
+ int tu_drm_export_dmabuf(struct tu_device *dev, struct tu_bo *bo);
+-void tu_drm_bo_finish(struct tu_device *dev, struct tu_bo *bo);
++
++void tu_bo_list_del(struct tu_device *dev, struct tu_bo *bo);
++void tu_bo_make_zombie(struct tu_device *dev, struct tu_bo *bo);
+ 
+ struct tu_msm_queue_submit
+ {
+    struct util_dynarray commands;
+    struct util_dynarray command_bos;
++   struct util_dynarray binds;
+ };
+ 
+ void *msm_submit_create(struct tu_device *device);
+@@ -33,6 +36,11 @@
+ void msm_submit_add_entries(struct tu_device *device, void *_submit,
+                             struct tu_cs_entry *entries,
+                             unsigned num_entries);
++void msm_submit_add_bind(struct tu_device *device,
++                         void *_submit,
++                         struct tu_sparse_vma *vma, uint64_t vma_offset,
++                         struct tu_bo *bo, uint64_t bo_offset,
++                         uint64_t size);
+ 
+ static inline void
+ get_abs_timeout(struct drm_msm_timespec *tv, uint64_t ns)
+Index: src/freedreno/ir3/ir3_a6xx.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/ir3/ir3_a6xx.c b/src/freedreno/ir3/ir3_a6xx.c
+--- a/src/freedreno/ir3/ir3_a6xx.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/ir3/ir3_a6xx.c	(date 1738998728520)
+@@ -299,7 +299,7 @@
+                           struct ir3_instruction **dst)
+ {
+    struct ir3_builder *b = &ctx->build;
+-   struct ir3_instruction *ldib;
++   struct ir3_instruction *ldib, *rck;
+    struct ir3_instruction *const *coords = ir3_get_src(ctx, &intr->src[1]);
+    unsigned ncoords = ir3_get_image_coords(intr, NULL);
+ 
+@@ -316,6 +316,24 @@
+    ir3_handle_bindless_cat6(ldib, intr->src[0]);
+    ir3_handle_nonuniform(ldib, intr);
+ 
++   unsigned num_components = intr->num_components;
++   if (intr->intrinsic == nir_intrinsic_image_sparse_load ||
++       intr->intrinsic == nir_intrinsic_bindless_image_sparse_load) {
++      rck = ir3_LDIB(b, ir3_image_to_ibo(ctx, intr->src[0]), 0,
++                      ir3_create_collect(b, coords, ncoords), 0,
++                      create_immed(b, 0), 0);
++      rck->dsts[0]->wrmask = 0b1;
++      rck->cat6.iim_val = intr->num_components;
++      rck->cat6.d = ncoords;
++      rck->cat6.type = TYPE_U32;
++      rck->cat6.typed = true;
++      ir3_handle_bindless_cat6(rck, intr->src[0]);
++      ir3_handle_nonuniform(rck, intr);
++
++      num_components--;
++      dst[num_components] = rck;
++   }
++
+    ir3_split_dest(b, dst, ldib, 0, intr->num_components);
+ }
+ 
+Index: src/freedreno/decode/replay.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/decode/replay.c b/src/freedreno/decode/replay.c
+--- a/src/freedreno/decode/replay.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/decode/replay.c	(date 1738998728433)
+@@ -562,7 +562,7 @@
+          submit_bo->handle = buf->gem_handle;
+          submit_bo->flags =
+             buf->flags | MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE;
+-         submit_bo->presumed = buf->iova;
++         submit_bo->address = buf->iova;
+ 
+          buf->flags = 0;
+       }
+@@ -570,7 +570,7 @@
+       bo_list[0].handle = dev->va_id;
+       bo_list[0].flags =
+          MSM_SUBMIT_BO_DUMP | MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE;
+-      bo_list[0].presumed = dev->va_iova;
++      bo_list[0].address = dev->va_iova;
+    }
+ 
+    struct drm_msm_gem_submit submit_req = {
+Index: src/freedreno/ir3/ir3_lexer.l
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/ir3/ir3_lexer.l b/src/freedreno/ir3/ir3_lexer.l
+--- a/src/freedreno/ir3/ir3_lexer.l	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/ir3/ir3_lexer.l	(date 1738998728553)
+@@ -485,6 +485,8 @@
+ "k"                               return 'k';
+ "u"                               return 'u';
+ "v"                               return 'v';
++"rck"                             return T_RCK;
++"clp"                             return T_CLP;
+ "base"[0-9]+                      ir3_yylval.num = strtol(yytext+4, NULL, 10); return T_BASE;
+ "offset"[0-9]+                    ir3_yylval.num = strtol(yytext+6, NULL, 10); return T_OFFSET;
+ "uniform"                         return T_UNIFORM;
+Index: src/freedreno/vulkan/tu_buffer.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_buffer.h b/src/freedreno/vulkan/tu_buffer.h
+--- a/src/freedreno/vulkan/tu_buffer.h	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_buffer.h	(date 1738998728623)
+@@ -12,15 +12,23 @@
+ 
+ #include "tu_common.h"
+ 
++#include "tu_knl.h"
++
+ #include "vk_buffer.h"
+ 
+ struct tu_buffer
+ {
+    struct vk_buffer vk;
+ 
+-   struct tu_bo *bo;
+    uint64_t iova;
+-   uint64_t bo_size;
++
++   union {
++      struct {
++         struct tu_bo *bo;
++         uint64_t bo_size;
++      };
++      struct tu_sparse_vma vma;
++   };
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(tu_buffer, vk.base, VkBuffer,
+Index: src/freedreno/isa/ir3-cat6.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/isa/ir3-cat6.xml b/src/freedreno/isa/ir3-cat6.xml
+--- a/src/freedreno/isa/ir3-cat6.xml	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/isa/ir3-cat6.xml	(date 1738998728608)
+@@ -1046,11 +1046,11 @@
+ 	<field   low="6"  high="7"  name="MODE" type="#cat6-src-mode"/>
+ 	<field   pos="8"            name="BINDLESS" type="bool"/>
+ 	<field   low="12" high="13" name="TYPE_SIZE_MINUS_ONE" type="uint"/>
+-	<pattern pos="40"          >0</pattern>
+ 	<encode>
+ 		<map name="MODE">extract_cat6_DESC_MODE(src)</map>
+ 		<map name="TYPE_SIZE_MINUS_ONE">src->cat6.iim_val - 1</map>
+ 		<map name="BINDLESS">!!(src->flags &amp; IR3_INSTR_B)</map>
++		<map name="RCK">!!(src->flags &amp; IR3_INSTR_RCK)</map>
+ 		<map name="BASE">src</map>
+ 	</encode>
+ </bitset>
+@@ -1058,6 +1058,7 @@
+ <bitset name="#instruction-cat6-a6xx" extends="#instruction-cat6-a6xx-base">
+ 	<pattern  low="4"  high="5" >00</pattern>
+ 	<pattern  low="54" high="58">00000</pattern>
++	<pattern  pos="40">0</pattern>
+ </bitset>
+ 
+ <bitset name="#cat6-ldc-common" extends="#instruction-cat6-a6xx">
+@@ -1244,7 +1245,7 @@
+ 		IBO (ie. Image/SSBO) instructions
+ 	</doc>
+ 	<display>
+-		{SY}{JP}{NAME}.{TYPED}.{D}d.{TYPE}.{TYPE_SIZE}.{MODE}{BASE} {TYPE_HALF}{SRC1}, {SRC2}{OFFSET}, {SSBO}
++		{SY}{JP}{NAME}.{TYPED}.{D}d.{TYPE}{RCK}.{TYPE_SIZE}.{MODE}{BASE} {TYPE_HALF}{SRC1}, {SRC2}{OFFSET}, {SSBO}
+ 	</display>
+ 
+ 	<derived name="D" expr="#cat6-d" type="uint"/>
+@@ -1256,6 +1257,7 @@
+ 	<pattern low="20" high="22">110</pattern>
+ 	<field   low="24" high="31" name="SRC2" type="#reg-gpr"/>
+ 	<field   low="32" high="39" name="SRC1" type="#reg-gpr"/>
++	<field   pos="40" name="RCK" type="bool" display=".rck"/>
+ 	<field   low="41" high="48" name="SSBO" type="#cat6-src">   <!-- SSBO/image binding point -->
+ 		<param name="SSBO_IM" as="SRC_IM"/>
+ 	</field>
+Index: src/freedreno/vulkan/tu_queue.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
+--- a/src/freedreno/vulkan/tu_queue.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_queue.cc	(date 1738998728788)
+@@ -9,8 +9,10 @@
+ 
+ #include "tu_queue.h"
+ 
++#include "tu_buffer.h"
+ #include "tu_cmd_buffer.h"
+ #include "tu_dynamic_rendering.h"
++#include "tu_image.h"
+ #include "tu_knl.h"
+ #include "tu_device.h"
+ 
+@@ -19,11 +21,12 @@
+ static int
+ tu_get_submitqueue_priority(const struct tu_physical_device *pdevice,
+                             VkQueueGlobalPriorityKHR global_priority,
++                            enum tu_queue_type type,
+                             bool global_priority_query)
+ {
+    if (global_priority_query) {
+       VkQueueFamilyGlobalPriorityPropertiesKHR props;
+-      tu_physical_device_get_global_priority_properties(pdevice, &props);
++      tu_physical_device_get_global_priority_properties(pdevice, type, &props);
+ 
+       bool valid = false;
+       for (uint32_t i = 0; i < props.priorityCount; i++) {
+@@ -37,6 +40,10 @@
+          return -1;
+    }
+ 
++   /* drm/msm requires a priority of 0 */
++   if (type == TU_QUEUE_SPARSE)
++      return 0;
++
+    /* Valid values are from 0 to (pdevice->submitqueue_priority_count - 1),
+     * with 0 being the highest priority.  This matches what freedreno does.
+     */
+@@ -230,9 +237,83 @@
+    return result;
+ }
+ 
++static VkResult
++queue_submit_sparse(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
++{
++   struct tu_queue *queue = list_entry(_queue, struct tu_queue, vk);
++   struct tu_device *device = queue->device;
++
++   pthread_mutex_lock(&device->submit_mutex);
++
++   void *submit = tu_submit_create(device);
++   if (!submit)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   for (uint32_t i = 0; i < vk_submit->buffer_bind_count; i++) {
++      const VkSparseBufferMemoryBindInfo *bind = &vk_submit->buffer_binds[i];
++      VK_FROM_HANDLE(tu_buffer, buffer, bind->buffer);
++
++      for (uint32_t j = 0; j < bind->bindCount; j++) {
++         const VkSparseMemoryBind *range = &bind->pBinds[j];
++         VK_FROM_HANDLE(tu_device_memory, mem, range->memory);
++
++         tu_submit_add_bind(queue->device, submit,
++                            &buffer->vma, range->resourceOffset,
++                            mem ? mem->bo : NULL,
++                            mem ? range->memoryOffset : 0,
++                            range->size);
++      }
++   }
++
++   for (uint32_t i = 0; i < vk_submit->image_bind_count; i++) {
++      const VkSparseImageMemoryBindInfo *bind = &vk_submit->image_binds[i];
++      VK_FROM_HANDLE(tu_image, image, bind->image);
++
++      for (uint32_t j = 0; j < bind->bindCount; j++)
++         tu_bind_sparse_image(device, submit, image, &bind->pBinds[j]);
++   }
++
++   for (uint32_t i = 0; i < vk_submit->image_opaque_bind_count; i++) {
++      const VkSparseImageOpaqueMemoryBindInfo *bind =
++         &vk_submit->image_opaque_binds[i];
++      VK_FROM_HANDLE(tu_image, image, bind->image);
++
++      for (uint32_t j = 0; j < bind->bindCount; j++) {
++         const VkSparseMemoryBind *range = &bind->pBinds[j];
++         VK_FROM_HANDLE(tu_device_memory, mem, range->memory);
++
++         tu_submit_add_bind(queue->device, submit,
++                            &image->vma, range->resourceOffset,
++                            mem ? mem->bo : NULL,
++                            mem ? range->memoryOffset : 0,
++                            range->size);
++      }
++   }
++
++   VkResult result =
++      tu_queue_submit(queue, submit, vk_submit->waits, vk_submit->wait_count,
++                      vk_submit->signals, vk_submit->signal_count,
++                      NULL);
++
++   if (result != VK_SUCCESS) {
++      pthread_mutex_unlock(&device->submit_mutex);
++      goto out;
++   }
++
++   device->submit_count++;
++
++   pthread_mutex_unlock(&device->submit_mutex);
++   pthread_cond_broadcast(&queue->device->timeline_cond);
++
++out:
++   tu_submit_finish(device, submit);
++
++   return result;
++}
+ VkResult
+ tu_queue_init(struct tu_device *device,
+               struct tu_queue *queue,
++              enum tu_queue_type type,
+               int idx,
+               const VkDeviceQueueCreateInfo *create_info)
+ {
+@@ -245,7 +326,7 @@
+        VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR);
+ 
+    const int priority = tu_get_submitqueue_priority(
+-         device->physical_device, global_priority,
++         device->physical_device, global_priority, type,
+          device->vk.enabled_features.globalPriorityQuery);
+    if (priority < 0) {
+       return vk_startup_errorf(device->instance, VK_ERROR_INITIALIZATION_FAILED,
+@@ -258,9 +339,10 @@
+ 
+    queue->device = device;
+    queue->priority = priority;
+-   queue->vk.driver_submit = queue_submit;
++   queue->vk.driver_submit =
++      (type == TU_QUEUE_SPARSE) ? queue_submit_sparse : queue_submit;
+ 
+-   int ret = tu_drm_submitqueue_new(device, priority, &queue->msm_queue_id);
++   int ret = tu_drm_submitqueue_new(device, type, priority, &queue->msm_queue_id);
+    if (ret)
+       return vk_startup_errorf(device->instance, VK_ERROR_INITIALIZATION_FAILED,
+                                "submitqueue create failed");
+Index: src/freedreno/vulkan/tu_knl_drm.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_knl_drm.cc b/src/freedreno/vulkan/tu_knl_drm.cc
+--- a/src/freedreno/vulkan/tu_knl_drm.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_knl_drm.cc	(date 1738998728743)
+@@ -59,26 +59,8 @@
+ }
+ 
+ void
+-tu_drm_bo_finish(struct tu_device *dev, struct tu_bo *bo)
++tu_bo_list_del(struct tu_device *dev, struct tu_bo *bo)
+ {
+-   assert(bo->gem_handle);
+-
+-   u_rwlock_rdlock(&dev->dma_bo_lock);
+-
+-   if (!p_atomic_dec_zero(&bo->refcnt)) {
+-      u_rwlock_rdunlock(&dev->dma_bo_lock);
+-      return;
+-   }
+-
+-   if (bo->map) {
+-      TU_RMV(bo_unmap, dev, bo);
+-      munmap(bo->map, bo->size);
+-   }
+-
+-   TU_RMV(bo_destroy, dev, bo);
+-   tu_debug_bos_del(dev, bo);
+-   tu_dump_bo_del(dev, bo);
+-
+    mtx_lock(&dev->bo_mutex);
+    dev->submit_bo_count--;
+    dev->submit_bo_list[bo->submit_bo_list_idx] = dev->submit_bo_list[dev->submit_bo_count];
+@@ -90,44 +72,28 @@
+       dev->implicit_sync_bo_count--;
+ 
+    mtx_unlock(&dev->bo_mutex);
++}
+ 
+-   if (dev->physical_device->has_set_iova) {
+-      mtx_lock(&dev->vma_mutex);
+-      struct tu_zombie_vma *vma = (struct tu_zombie_vma *)
+-            u_vector_add(&dev->zombie_vmas);
+-      vma->gem_handle = bo->gem_handle;
++void
++tu_bo_make_zombie(struct tu_device *dev, struct tu_bo *bo)
++{
++   mtx_lock(&dev->vma_mutex);
++   struct tu_zombie_vma *vma = (struct tu_zombie_vma *)
++         u_vector_add(&dev->zombie_vmas);
++   vma->gem_handle = bo->gem_handle;
+ #ifdef TU_HAS_VIRTIO
+-      vma->res_id = bo->res_id;
++   vma->res_id = bo->res_id;
+ #endif
+-      vma->iova = bo->iova;
+-      vma->size = bo->size;
+-      vma->fence = p_atomic_read(&dev->queues[0]->fence);
++   vma->iova = bo->iova;
++   vma->size = bo->size;
++   vma->fence = p_atomic_read(&dev->queues[0]->fence);
+ 
+-      /* Must be cleared under the VMA mutex, or another thread could race to
+-       * reap the VMA, closing the BO and letting a new GEM allocation produce
+-       * this handle again.
+-       */
+-      memset(bo, 0, sizeof(*bo));
+-      mtx_unlock(&dev->vma_mutex);
+-   } else {
+-      /* Our BO structs are stored in a sparse array in the physical device,
+-       * so we don't want to free the BO pointer, instead we want to reset it
+-       * to 0, to signal that array entry as being free.
+-       */
+-      uint32_t gem_handle = bo->gem_handle;
+-      memset(bo, 0, sizeof(*bo));
+-
+-      /* Note that virtgpu GEM_CLOSE path is a bit different, but it does
+-       * not use the !has_set_iova path so we can ignore that
+-       */
+-      struct drm_gem_close req = {
+-         .handle = gem_handle,
+-      };
+-
+-      drmIoctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &req);
+-   }
+-
+-   u_rwlock_rdunlock(&dev->dma_bo_lock);
++   /* Must be cleared under the VMA mutex, or another thread could race to
++    * reap the VMA, closing the BO and letting a new GEM allocation produce
++    * this handle again.
++    */
++   memset(bo, 0, sizeof(*bo));
++   mtx_unlock(&dev->vma_mutex);
+ }
+ 
+ void *
+@@ -146,6 +112,7 @@
+ 
+    util_dynarray_fini(&submit->commands);
+    util_dynarray_fini(&submit->command_bos);
++   util_dynarray_fini(&submit->binds);
+    vk_free(&device->vk.alloc, submit);
+ }
+ 
+@@ -156,6 +123,8 @@
+    struct tu_msm_queue_submit *submit =
+       (struct tu_msm_queue_submit *)_submit;
+ 
++   bool has_vm_bind = device->physical_device->has_sparse;
++
+    struct drm_msm_gem_submit_cmd *cmds = (struct drm_msm_gem_submit_cmd *)
+       util_dynarray_grow(&submit->commands, struct drm_msm_gem_submit_cmd,
+                          num_entries);
+@@ -166,16 +135,43 @@
+ 
+    for (unsigned i = 0; i < num_entries; i++) {
+       cmds[i].type = MSM_SUBMIT_CMD_BUF;
+-      cmds[i].submit_idx = entries[i].bo->submit_bo_list_idx;
+-      cmds[i].submit_offset = entries[i].offset;
++      cmds[i].submit_idx = has_vm_bind ? 0 : entries[i].bo->submit_bo_list_idx;
++      cmds[i].submit_offset = has_vm_bind ? 0 : entries[i].offset;
+       cmds[i].size = entries[i].size;
+       cmds[i].pad = 0;
+       cmds[i].nr_relocs = 0;
+-      cmds[i].relocs = 0;
++      if (has_vm_bind)
++         cmds[i].iova = entries[i].bo->iova + entries[i].offset;
++      else
++         cmds[i].relocs = 0;
+       bos[i] = entries[i].bo;
+    }
+ }
+ 
++void
++msm_submit_add_bind(struct tu_device *device,
++                    void *_submit,
++                    struct tu_sparse_vma *vma, uint64_t vma_offset,
++                    struct tu_bo *bo, uint64_t bo_offset,
++                    uint64_t size)
++{
++   struct tu_msm_queue_submit *submit =
++      (struct tu_msm_queue_submit *)_submit;
++
++   struct drm_msm_gem_submit_bo_v2 bind = {
++      .flags = bo ? MSM_SUBMIT_BO_OP_MAP :
++         ((vma->flags & TU_SPARSE_VMA_MAP_ZERO) ?
++            MSM_SUBMIT_BO_OP_MAP_NULL : MSM_SUBMIT_BO_OP_UNMAP),
++      .handle = bo ? bo->gem_handle : 0,
++      .address = vma->msm.iova + vma_offset,
++      .bo_offset = bo_offset,
++      .range = size,
++   };
++
++   util_dynarray_append(&submit->binds, struct drm_msm_gem_submit_bo_v2,
++                        bind);
++}
++
+ uint32_t
+ tu_syncobj_from_vk_sync(struct vk_sync *sync)
+ {
+Index: src/freedreno/ir3/ir3_parser.y
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/ir3/ir3_parser.y b/src/freedreno/ir3/ir3_parser.y
+--- a/src/freedreno/ir3/ir3_parser.y	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/ir3/ir3_parser.y	(date 1738998728581)
+@@ -744,6 +744,8 @@
+ %token <tok> T_UNIFORM
+ %token <tok> T_NONUNIFORM
+ %token <tok> T_IMM
++%token <tok> T_RCK
++%token <tok> T_CLP
+ 
+ %token <tok> T_NAN
+ %token <tok> T_INF
+@@ -1186,12 +1188,15 @@
+ |                  '.' T_NONUNIFORM  { instr->flags |= IR3_INSTR_NONUNIF; }
+ |                  '.' T_BASE     { instr->flags |= IR3_INSTR_B; instr->cat5.tex_base = $2; }
+ |                  '.' T_W        { instr->cat5.cluster_size = $2; }
++|                  '.' T_RCK      { instr->flags |= IR3_INSTR_RCK; }
++|                  '.' T_CLP      { instr->flags |= IR3_INSTR_CLP; }
+ cat5_flags:
+ |                  cat5_flag cat5_flags
+ 
+ cat5_samp:         T_SAMP         { instr->cat5.samp = $1; }
+ cat5_tex:          T_TEX          { instr->cat5.tex = $1; }
+ cat5_type:         '(' type ')'   { instr->cat5.type = $2; }
++|                                 { } /* type does not exist for rck */
+ cat5_a1:           src_a1         { instr->flags |= IR3_INSTR_A1EN; }
+ 
+ cat5_samp_tex:     src_gpr
+@@ -1366,10 +1371,13 @@
+ 
+ cat6_bindless_ibo_opc_3src_dst: T_OP_LDIB_B              { new_instr(OPC_LDIB); }
+ 
++cat6_rck:
++|                  T_RCK '.' { instr->flags |= IR3_INSTR_RCK; }
++
+ cat6_bindless_ibo: cat6_bindless_ibo_opc_1src cat6_typed cat6_dim cat6_type '.' cat6_immed '.' cat6_bindless_mode dst_reg ',' cat6_reg_or_immed
+ |                  cat6_bindless_ibo_opc_2src cat6_typed cat6_dim cat6_type '.' cat6_immed '.' cat6_bindless_mode src_reg ',' cat6_reg_or_immed ',' cat6_reg_or_immed { swap(instr->srcs[0], instr->srcs[2]); }
+ |                  cat6_bindless_ibo_opc_3src cat6_typed cat6_dim cat6_type '.' cat6_immed '.' cat6_bindless_mode src_reg ',' cat6_reg_or_immed src_uoffset ',' cat6_reg_or_immed { swap(instr->srcs[0], instr->srcs[3]); }
+-|                  cat6_bindless_ibo_opc_3src_dst cat6_typed cat6_dim cat6_type '.' cat6_immed '.' cat6_bindless_mode dst_reg ',' cat6_reg_or_immed src_uoffset ',' cat6_reg_or_immed { swap(instr->srcs[0], instr->srcs[2]); swap(instr->srcs[1], instr->srcs[2]); }
++|                  cat6_bindless_ibo_opc_3src_dst cat6_typed cat6_dim cat6_type '.' cat6_rck cat6_immed '.' cat6_bindless_mode dst_reg ',' cat6_reg_or_immed src_uoffset ',' cat6_reg_or_immed { swap(instr->srcs[0], instr->srcs[2]); swap(instr->srcs[1], instr->srcs[2]); }
+ 
+ cat6_bindless_ldc_opc: T_OP_LDC  { new_instr(OPC_LDC); }
+ 
+Index: src/freedreno/vulkan/tu_queue.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_queue.h b/src/freedreno/vulkan/tu_queue.h
+--- a/src/freedreno/vulkan/tu_queue.h	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_queue.h	(date 1738998728794)
+@@ -12,6 +12,12 @@
+ 
+ #include "tu_common.h"
+ 
++enum tu_queue_type
++{
++   TU_QUEUE_GFX,
++   TU_QUEUE_SPARSE,
++};
++
+ struct tu_queue
+ {
+    struct vk_queue vk;
+@@ -28,6 +34,7 @@
+ VkResult
+ tu_queue_init(struct tu_device *device,
+               struct tu_queue *queue,
++              enum tu_queue_type type,
+               int idx,
+               const VkDeviceQueueCreateInfo *create_info);
+ 
+Index: src/freedreno/ir3/ir3.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/ir3/ir3.h b/src/freedreno/ir3/ir3.h
+--- a/src/freedreno/ir3/ir3.h	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/ir3/ir3.h	(date 1738998728511)
+@@ -386,6 +386,14 @@
+     * their sources.
+     */
+    IR3_INSTR_IMM_OFFSET = BIT(21),
++
++   /* Residency ChecK. Returns if the equivalent access would've accesssed a
++    * non-resident page. Only allowed for cat5 texture loads and ldib.
++    */
++   IR3_INSTR_RCK = BIT(22),
++
++   /* Clamp computed LOD using the given minimum. Only for cat5. */
++   IR3_INSTR_CLP = BIT(23),
+ } ir3_instruction_flags;
+ 
+ struct ir3_instruction {
+Index: src/freedreno/drm/virtio/virtio_ringbuffer.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/drm/virtio/virtio_ringbuffer.c b/src/freedreno/drm/virtio/virtio_ringbuffer.c
+--- a/src/freedreno/drm/virtio/virtio_ringbuffer.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/drm/virtio/virtio_ringbuffer.c	(date 1738998728455)
+@@ -131,7 +131,7 @@
+ 
+       submit_bos[i].flags = fd_submit->bos[i]->reloc_flags;
+       submit_bos[i].handle = virtio_bo->res_id;
+-      submit_bos[i].presumed = 0;
++      submit_bos[i].address = 0;
+    }
+ 
+    if (virtio_pipe->next_submit_fence <= 0)
+Index: src/freedreno/fdl/freedreno_layout.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/fdl/freedreno_layout.c b/src/freedreno/fdl/freedreno_layout.c
+--- a/src/freedreno/fdl/freedreno_layout.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/fdl/freedreno_layout.c	(date 1738998728485)
+@@ -58,3 +58,123 @@
+          fdl_tile_mode_desc(layout, level));
+    }
+ }
++
++void
++fdl_get_sparse_block_size(enum pipe_format format, uint32_t nr_samples,
++                          uint32_t *blockwidth, uint32_t *blockheight)
++{
++   /* This is taken from the table in section 33.4.3 "Standard Sparse Image
++    * Block Shapes"
++    */
++
++   switch (nr_samples) {
++   case 1:
++      switch (util_format_get_blocksize(format)) {
++      case 1:
++         *blockwidth = 256;
++         *blockheight = 256;
++         break;
++      case 2:
++         *blockwidth = 256;
++         *blockheight = 128;
++         break;
++      case 4:
++         *blockwidth = 128;
++         *blockheight = 128;
++         break;
++      case 8:
++         *blockwidth = 128;
++         *blockheight = 64;
++         break;
++      case 16:
++         *blockwidth = 64;
++         *blockheight = 64;
++         break;
++      default:
++         unreachable("invalid block size");
++      }
++      break;
++   case 2:
++      switch (util_format_get_blocksize(format)) {
++      case 1:
++         *blockwidth = 128;
++         *blockheight = 256;
++         break;
++      case 2:
++         *blockwidth = 128;
++         *blockheight = 128;
++         break;
++      case 4:
++         *blockwidth = 64;
++         *blockheight = 128;
++         break;
++      case 8:
++         *blockwidth = 64;
++         *blockheight = 64;
++         break;
++      case 16:
++         *blockwidth = 32;
++         *blockheight = 64;
++         break;
++      default:
++         unreachable("invalid block size");
++      }
++      break;
++   case 4:
++      switch (util_format_get_blocksize(format)) {
++      case 1:
++         *blockwidth = 128;
++         *blockheight = 128;
++         break;
++      case 2:
++         *blockwidth = 128;
++         *blockheight = 64;
++         break;
++      case 4:
++         *blockwidth = 64;
++         *blockheight = 64;
++         break;
++      case 8:
++         *blockwidth = 64;
++         *blockheight = 32;
++         break;
++      case 16:
++         *blockwidth = 32;
++         *blockheight = 32;
++         break;
++      default:
++         unreachable("invalid block size");
++      }
++      break;
++   case 8:
++      switch (util_format_get_blocksize(format)) {
++      case 1:
++         *blockwidth = 64;
++         *blockheight = 128;
++         break;
++      case 2:
++         *blockwidth = 64;
++         *blockheight = 64;
++         break;
++      case 4:
++         *blockwidth = 32;
++         *blockheight = 64;
++         break;
++      case 8:
++         *blockwidth = 32;
++         *blockheight = 32;
++         break;
++      case 16:
++         *blockwidth = 16;
++         *blockheight = 32;
++         break;
++      default:
++         unreachable("invalid block size");
++      }
++      break;
++   /* 16X MSAA is not supported */
++   default:
++      unreachable("invalid MSAA count");
++   }
++}
++
+Index: src/freedreno/vulkan/tu_knl_kgsl.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc	(date 1738998728781)
+@@ -51,6 +51,7 @@
+ 
+ static int
+ kgsl_submitqueue_new(struct tu_device *dev,
++                     enum tu_queue_type type,
+                      int priority,
+                      uint32_t *queue_id)
+ {
+@@ -165,6 +166,37 @@
+    return tu_bo_init_dmabuf(dev, out_bo, -1, share.fd);
+ }
+ 
++static VkResult
++kgsl_bo_user_map(struct tu_device *dev, struct tu_bo *bo, uint64_t client_iova)
++{
++   uint64_t offset = bo->gem_handle << 12;
++   void *map = mmap((void *)client_iova, bo->size, PROT_READ | PROT_WRITE,
++                    MAP_SHARED, dev->physical_device->local_fd, offset);
++   if (map == MAP_FAILED) {
++      kgsl_bo_finish(dev, bo);
++
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "mmap failed (%s)", strerror(errno));
++   }
++
++   if (client_iova && (uint64_t)map != client_iova) {
++      kgsl_bo_finish(dev, bo);
++
++      return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++                       "mmap could not map the given address");
++   }
++
++   bo->map = map;
++   bo->iova = (uint64_t)map;
++
++   /* Because we're using SVM, the CPU mapping and GPU mapping are the same
++    * and the CPU mapping must stay fixed for the lifetime of the BO.
++    */
++   bo->never_unmap = true;
++
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ kgsl_bo_init(struct tu_device *dev,
+              struct vk_object_base *base,
+@@ -238,30 +270,9 @@
+    };
+ 
+    if (flags & TU_BO_ALLOC_REPLAYABLE) {
+-      uint64_t offset = req.id << 12;
+-      void *map = mmap((void *)client_iova, bo->size, PROT_READ | PROT_WRITE,
+-                       MAP_SHARED, dev->physical_device->local_fd, offset);
+-      if (map == MAP_FAILED) {
+-         kgsl_bo_finish(dev, bo);
+-
+-         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                          "mmap failed (%s)", strerror(errno));
+-      }
+-
+-      if (client_iova && (uint64_t)map != client_iova) {
+-         kgsl_bo_finish(dev, bo);
+-
+-         return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+-                          "mmap could not map the given address");
+-      }
+-
+-      bo->map = map;
+-      bo->iova = (uint64_t)map;
+-
+-      /* Because we're using SVM, the CPU mapping and GPU mapping are the same
+-       * and the CPU mapping must stay fixed for the lifetime of the BO.
+-       */
+-      bo->never_unmap = true;
++      VkResult result = kgsl_bo_user_map(dev, bo, client_iova);
++      if (result != VK_SUCCESS)
++         return result;
+    }
+ 
+    tu_dump_bo_init(dev, bo);
+@@ -395,6 +406,124 @@
+    safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
+ }
+ 
++static VkResult
++kgsl_sparse_vma_init(struct tu_device *dev,
++                     struct vk_object_base *base,
++                     struct tu_sparse_vma *out_vma,
++                     uint64_t *out_iova,
++                     enum tu_sparse_vma_flags flags,
++                     uint64_t size, uint64_t client_iova)
++{
++   /* Note: we cannot use kgsl_gpumem_alloc_id because it only has a 32-bit
++    * flags value. kgsl_gpuobj_alloc seems to be the only ioctl we can use.
++    */
++   struct kgsl_gpuobj_alloc req = {
++      .size = size,
++      .flags = KGSL_MEMFLAGS_VBO,
++      .va_len = 0, /* seems to be unused? */
++   };
++
++   if (flags & TU_SPARSE_VMA_REPLAYABLE)
++      req.flags |= KGSL_MEMFLAGS_USE_CPU_MAP;
++
++   if (!(flags & TU_SPARSE_VMA_MAP_ZERO))
++      req.flags |= KGSL_MEMFLAGS_VBO_NO_MAP_ZERO;
++
++   int ret;
++
++   ret = safe_ioctl(dev->physical_device->local_fd,
++                    IOCTL_KGSL_GPUOBJ_ALLOC, &req);
++   if (ret) {
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "GPUOBJ_ALLOC failed (%s)", strerror(errno));
++   }
++
++   struct tu_bo *bo = tu_device_lookup_bo(dev, req.id);
++   assert(bo && bo->gem_handle == 0);
++
++   *bo = (struct tu_bo) {
++      .gem_handle = req.id,
++      .size = req.mmapsize,
++      .name = NULL,
++      .refcnt = 1,
++      .shared_fd = -1,
++      .base = base,
++   };
++
++   if (flags & TU_SPARSE_VMA_REPLAYABLE) {
++      VkResult result = kgsl_bo_user_map(dev, bo, client_iova);
++      if (result != VK_SUCCESS)
++         return result;
++   } else {
++      /* For some cursed reason, the ioctl doesn't return the GPU address so
++       * we have to query it.
++       */
++      struct kgsl_gpumem_get_info info = {
++         .id = req.id,
++      };
++
++      ret = safe_ioctl(dev->physical_device->local_fd,
++                       IOCTL_KGSL_GPUMEM_GET_INFO, &info);
++      if (ret) {
++         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                          "GPUMEM_GET_INFO failed (%s)", strerror(errno));
++      }
++
++      bo->iova = info.gpuaddr;
++   }
++
++   out_vma->kgsl.virtual_bo = bo;
++   *out_iova = bo->iova;
++   return VK_SUCCESS;
++}
++
++static VkResult
++kgsl_sparse_vma_map(struct tu_device *dev,
++                    struct tu_sparse_vma *vma,
++                    struct tu_bo *bo, uint64_t bo_offset)
++{
++   struct kgsl_gpumem_bind_range range = {
++      .child_offset = bo_offset,
++      .target_offset = 0,
++      .length = vma->kgsl.virtual_bo->size,
++      .child_id = bo->gem_handle,
++      .op = KGSL_GPUMEM_RANGE_OP_BIND,
++   };
++
++   struct kgsl_gpumem_bind_ranges req = {
++      .ranges = (uint64_t)(uintptr_t)&range,
++      .ranges_nents = 1,
++      .ranges_size = sizeof(range),
++      .id = vma->kgsl.virtual_bo->gem_handle,
++      .flags = 0,
++   };
++
++   int ret;
++
++   ret = safe_ioctl(dev->physical_device->local_fd,
++                    IOCTL_KGSL_GPUMEM_BIND_RANGES, &req);
++   if (ret) {
++      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "GPUMEM_BIND_RANGES failed (%s)", strerror(errno));
++   }
++
++   return VK_SUCCESS;
++}
++
++static void
++kgsl_sparse_vma_finish(struct tu_device *dev,
++                       struct tu_sparse_vma *vma)
++{
++   struct kgsl_gpuobj_free req = {
++      .id = vma->kgsl.virtual_bo->gem_handle
++   };
++
++   /* Tell sparse array that entry is free */
++   memset(vma->kgsl.virtual_bo, 0, sizeof(*vma->kgsl.virtual_bo));
++
++   safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUOBJ_FREE, &req);
++}
++
+ static VkResult
+ get_kgsl_prop(int fd, unsigned int type, void *value, size_t size)
+ {
+@@ -426,6 +555,26 @@
+ 
+    safe_ioctl(fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req_free);
+ 
++   return true;
++}
++
++static bool
++kgsl_is_virtual_bo_supported(int fd)
++{
++   struct kgsl_gpuobj_alloc req_alloc = {
++      .size = 0x1000,
++      .flags = KGSL_MEMFLAGS_VBO,
++   };
++
++   int ret = safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &req_alloc);
++   if (ret) {
++      return false;
++   }
++
++   struct kgsl_gpuobj_free req_free = { .id = req_alloc.id };
++
++   safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &req_free);
++
+    return true;
+ }
+ 
+@@ -1035,6 +1184,10 @@
+ 
+ struct tu_kgsl_queue_submit {
+    struct util_dynarray commands;
++   struct util_dynarray ranges;
++   struct util_dynarray bind_cmds;
++   struct tu_sparse_vma *cur_vma;
++   unsigned cur_vma_range_start;
+ };
+ 
+ static void *
+@@ -1052,6 +1205,8 @@
+       (struct tu_kgsl_queue_submit *)_submit;
+ 
+    util_dynarray_fini(&submit->commands);
++   util_dynarray_fini(&submit->ranges);
++   util_dynarray_fini(&submit->bind_cmds);
+    vk_free(&device->vk.alloc, submit);
+ }
+ 
+@@ -1076,6 +1231,76 @@
+    }
+ }
+ 
++static void
++kgsl_submit_add_bind(struct tu_device *device,
++                     void *_submit,
++                     struct tu_sparse_vma *vma, uint64_t vma_offset,
++                     struct tu_bo *bo, uint64_t bo_offset,
++                     uint64_t size)
++{
++   struct tu_kgsl_queue_submit *submit =
++      (struct tu_kgsl_queue_submit *)_submit;
++
++   if (vma != submit->cur_vma) {
++      unsigned range_count =
++         util_dynarray_num_elements(&submit->ranges,
++                                    struct kgsl_gpumem_bind_range);
++      if (submit->cur_vma) {
++         struct kgsl_gpu_aux_command_bind *last_bind =
++            util_dynarray_top_ptr(&submit->bind_cmds,
++                                  struct kgsl_gpu_aux_command_bind);
++         last_bind->numranges = range_count - submit->cur_vma_range_start;
++      }
++
++      struct kgsl_gpu_aux_command_bind bind = {
++         .rangeslist = submit->ranges.size,
++         .numranges = 0,
++         .rangesize = sizeof(struct kgsl_gpumem_bind_range),
++         .target = vma->kgsl.virtual_bo->gem_handle,
++      };
++
++
++      util_dynarray_append(&submit->bind_cmds,
++                           struct kgsl_gpu_aux_command_bind, bind);
++
++      submit->cur_vma = vma;
++      submit->cur_vma_range_start = range_count;
++   }
++
++   struct kgsl_gpumem_bind_range range = {
++      .child_offset = bo_offset,
++      .target_offset = vma_offset,
++      .length = size,
++      .child_id = bo ? bo->gem_handle : 0,
++      .op = bo ? KGSL_GPUMEM_RANGE_OP_BIND : KGSL_GPUMEM_RANGE_OP_UNBIND,
++   };
++
++   util_dynarray_append(&submit->ranges, struct kgsl_gpumem_bind_range,
++                        range);
++}
++
++/* We don't know the actual CPU pointers until we've finished adding all the
++ * bind commands, so we put the offset from the base instead. We need to write
++ * the actual pointer after all the ranges are added. We also need to fill out
++ * of the size of the last command.
++ */
++static void
++kgsl_bind_finalize(struct tu_kgsl_queue_submit *submit)
++{
++   unsigned range_count =
++      util_dynarray_num_elements(&submit->ranges,
++                                 struct kgsl_gpumem_bind_range);
++   struct kgsl_gpu_aux_command_bind *last_bind =
++      util_dynarray_top_ptr(&submit->bind_cmds,
++                            struct kgsl_gpu_aux_command_bind);
++   last_bind->numranges = range_count - submit->cur_vma_range_start;
++
++   util_dynarray_foreach (&submit->bind_cmds,
++                          struct kgsl_gpu_aux_command_bind, bind) {
++      bind->rangeslist += (uint64_t)(uintptr_t)submit->ranges.data;
++   }
++}
++
+ static VkResult
+ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
+                   struct vk_sync_wait *waits, uint32_t wait_count,
+@@ -1089,7 +1314,7 @@
+    uint64_t start_ts = tu_perfetto_begin_submit();
+ #endif
+ 
+-   if (submit->commands.size == 0) {
++   if (submit->commands.size == 0 && submit->bind_cmds.size == 0) {
+       const struct kgsl_syncobj *wait_semaphores[wait_count + 1];
+       for (uint32_t i = 0; i < wait_count; i++) {
+          wait_semaphores[i] = &container_of(waits[i].sync,
+@@ -1130,6 +1355,9 @@
+ 
+    VkResult result = VK_SUCCESS;
+ 
++   if (submit->bind_cmds.size != 0)
++      kgsl_bind_finalize(submit);
++
+    if (u_trace_submission_data) {
+       mtx_lock(&queue->device->kgsl_profiling_mutex);
+       tu_suballoc_bo_alloc(&u_trace_submission_data->kgsl_timestamp_bo,
+@@ -1206,29 +1434,76 @@
+       unreachable("invalid syncobj state");
+    }
+ 
+-   struct kgsl_gpu_command req = {
+-      .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST,
+-      .cmdlist = (uintptr_t) submit->commands.data,
+-      .cmdsize = sizeof(struct kgsl_command_object),
+-      .numcmds = util_dynarray_num_elements(&submit->commands,
+-                                            struct kgsl_command_object),
+-      .synclist = (uintptr_t) &sync,
+-      .syncsize = sizeof(sync),
+-      .numsyncs = has_sync != 0 ? 1 : 0,
+-      .context_id = queue->msm_queue_id,
+-   };
++   int ret;
++   uint32_t timestamp;
++   uint64_t gpu_offset = 0;
++
++   if (submit->bind_cmds.size == 0) {
++      struct kgsl_gpu_command req = {
++         .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST,
++         .cmdlist = (uintptr_t) submit->commands.data,
++         .cmdsize = sizeof(struct kgsl_command_object),
++         .numcmds = util_dynarray_num_elements(&submit->commands,
++                                               struct kgsl_command_object),
++         .synclist = (uintptr_t) &sync,
++         .syncsize = sizeof(sync),
++         .numsyncs = has_sync != 0 ? 1 : 0,
++         .context_id = queue->msm_queue_id,
++      };
+ 
+-   if (obj_idx) {
+-      req.flags |= KGSL_CMDBATCH_PROFILING;
+-      req.objlist = (uintptr_t) objs;
+-      req.objsize = sizeof(struct kgsl_command_object);
+-      req.numobjs = obj_idx;
+-   }
++      if (obj_idx) {
++         req.flags |= KGSL_CMDBATCH_PROFILING;
++         req.objlist = (uintptr_t) objs;
++         req.objsize = sizeof(struct kgsl_command_object);
++         req.numobjs = obj_idx;
++      }
+ 
+-   int ret = safe_ioctl(queue->device->physical_device->local_fd,
+-                        IOCTL_KGSL_GPU_COMMAND, &req);
++      ret = safe_ioctl(queue->device->physical_device->local_fd,
++                       IOCTL_KGSL_GPU_COMMAND, &req);
+ 
+-   uint64_t gpu_offset = 0;
++      timestamp = req.timestamp;
++   } else {
++      /* kgsl doesn't support multiple bind commands at once */
++      uint32_t i = 0;
++      util_dynarray_foreach(&submit->bind_cmds,
++                            struct kgsl_gpu_aux_command_bind, bind) {
++         bool do_sync = has_sync && i == 0;
++
++         struct kgsl_gpu_aux_command_generic aux = {
++            .priv = (uintptr_t) bind,
++            .size = sizeof(*bind),
++            .type = KGSL_GPU_AUX_COMMAND_BIND,
++         };
++
++         uint32_t flags = KGSL_GPU_AUX_COMMAND_BIND;
++         if (do_sync)
++            flags |= KGSL_GPU_AUX_COMMAND_SYNC;
++
++         struct kgsl_gpu_aux_command req = {
++            .flags = flags,
++            .cmdlist = (uintptr_t) &aux,
++            .cmdsize = sizeof(aux),
++            .numcmds = 1,
++            .synclist = (uintptr_t) &sync,
++            .syncsize = sizeof(sync),
++            .numsyncs = do_sync ? 1 : 0,
++            .context_id = queue->msm_queue_id,
++         };
++         ret = safe_ioctl(queue->device->physical_device->local_fd,
++                          IOCTL_KGSL_GPU_AUX_COMMAND, &req);
++
++         if (ret) {
++            result = vk_device_set_lost(&queue->device->vk,
++                                        "bind submit failed: %s\n",
++                                        strerror(errno));
++            goto fail_submit;
++         }
++
++         timestamp = req.timestamp;
++         i++;
++      }
++   }
++
+ #if HAVE_PERFETTO
+    if (profiling_buffer) {
+       /* We need to wait for KGSL to queue the GPU command before we can read
+@@ -1276,7 +1551,7 @@
+       goto fail_submit;
+    }
+ 
+-   p_atomic_set(&queue->fence, req.timestamp);
++   p_atomic_set(&queue->fence, timestamp);
+ 
+    for (uint32_t i = 0; i < signal_count; i++) {
+       struct kgsl_syncobj *signal_sync =
+@@ -1286,7 +1561,7 @@
+       kgsl_syncobj_reset(signal_sync);
+       signal_sync->state = KGSL_SYNCOBJ_STATE_TS;
+       signal_sync->queue = queue;
+-      signal_sync->timestamp = req.timestamp;
++      signal_sync->timestamp = timestamp;
+    }
+ 
+    if (u_trace_submission_data) {
+@@ -1296,7 +1571,7 @@
+    }
+ 
+ fail_submit:
+-   if (result != VK_SUCCESS) {
++   if (result != VK_SUCCESS && u_trace_submission_data) {
+       mtx_lock(&queue->device->kgsl_profiling_mutex);
+       tu_suballoc_bo_free(&queue->device->kgsl_profiling_suballoc,
+                           &u_trace_submission_data->kgsl_timestamp_bo);
+@@ -1378,8 +1653,11 @@
+       .submit_create = kgsl_submit_create,
+       .submit_finish = kgsl_submit_finish,
+       .submit_add_entries = kgsl_submit_add_entries,
++      .submit_add_bind = kgsl_submit_add_bind,
+       .queue_submit = kgsl_queue_submit,
+       .queue_wait_fence = kgsl_queue_wait_fence,
++      .sparse_vma_init = kgsl_sparse_vma_init,
++      .sparse_vma_finish = kgsl_sparse_vma_finish,
+ };
+ 
+ static bool
+@@ -1491,6 +1769,15 @@
+       fd, KGSL_MEMFLAGS_IOCOHERENT |
+              (KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT));
+ 
++   device->has_sparse = kgsl_is_virtual_bo_supported(fd);
++   get_kgsl_prop(fd, KGSL_PROP_GPU_VA64_SIZE, &device->va_size,
++                 sizeof(device->va_size));
++   /* We don't actually use the VMA, but set a fake offset so that it doesn't
++    * think we're trying to allocate 0 and assert.
++    */
++   device->va_start = 0x100000000;
++
++
+    /* preemption is always supported on kgsl */
+    device->has_preemption = true;
+ 
+Index: src/freedreno/ir3/ir3_compiler_nir.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/ir3/ir3_compiler_nir.c b/src/freedreno/ir3/ir3_compiler_nir.c
+--- a/src/freedreno/ir3/ir3_compiler_nir.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/ir3/ir3_compiler_nir.c	(date 1738998728539)
+@@ -1782,7 +1782,7 @@
+ 
+    struct ir3_builder *b = &ctx->build;
+    struct tex_src_info info = get_image_ssbo_samp_tex_src(ctx, &intr->src[0], true);
+-   struct ir3_instruction *sam;
++   struct ir3_instruction *sam, *rck;
+    struct ir3_instruction *const *src0 = ir3_get_src(ctx, &intr->src[1]);
+    struct ir3_instruction *coords[4];
+    unsigned flags, ncoords = ir3_get_image_coords(intr, &flags);
+@@ -1814,6 +1814,17 @@
+    sam->barrier_conflict = IR3_BARRIER_IMAGE_W;
+ 
+    ir3_split_dest(b, dst, sam, 0, 4);
++
++   if (intr->intrinsic == nir_intrinsic_image_sparse_load ||
++       intr->intrinsic == nir_intrinsic_bindless_image_sparse_load) {
++      /* The results of the residency check cannot change within the shader, so
++       * it doesn't need any barriers.
++       */
++      rck = emit_sam(ctx, OPC_ISAM, info, type, 0b1,
++                     ir3_create_collect(b, coords, ncoords), NULL);
++      rck->flags |= IR3_INSTR_RCK;
++      dst[4] = rck;
++   }
+ }
+ 
+ /* A4xx version of image_size, see ir3_a6xx.c for newer resinfo version. */
+@@ -2898,6 +2909,8 @@
+       break;
+    case nir_intrinsic_image_load:
+    case nir_intrinsic_bindless_image_load:
++   case nir_intrinsic_image_sparse_load:
++   case nir_intrinsic_bindless_image_sparse_load:
+       emit_intrinsic_load_image(ctx, intr, dst);
+       break;
+    case nir_intrinsic_image_store:
+@@ -3618,11 +3631,12 @@
+ emit_tex(struct ir3_context *ctx, nir_tex_instr *tex)
+ {
+    struct ir3_builder *b = &ctx->build;
+-   struct ir3_instruction **dst, *sam, *src0[12], *src1[4];
++   struct ir3_instruction **dst, *sam, *src0[12], *src1[5];
+    struct ir3_instruction *const *coord, *const *off, *const *ddx, *const *ddy;
+-   struct ir3_instruction *lod, *compare, *proj, *sample_index;
++   struct ir3_instruction *lod, *compare, *proj, *sample_index, *min_lod;
+    struct tex_src_info info = {0};
+    bool has_bias = false, has_lod = false, has_proj = false, has_off = false;
++   bool has_min_lod = false;
+    unsigned i, coords, flags, ncomp;
+    unsigned nsrc0 = 0, nsrc1 = 0;
+    type_t type;
+@@ -3635,6 +3649,12 @@
+ 
+    dst = ir3_get_def(ctx, &tex->def, ncomp);
+ 
++   /* For sparse residency check, the last component is a residency code that is
++    * emitted separately.
++    */
++   if (tex->is_sparse)
++      ncomp--;
++
+    for (unsigned i = 0; i < tex->num_srcs; i++) {
+       switch (tex->src[i].src_type) {
+       case nir_tex_src_coord:
+@@ -3668,6 +3688,10 @@
+       case nir_tex_src_ms_index:
+          sample_index = ir3_get_src(ctx, &tex->src[i].src)[0];
+          break;
++      case nir_tex_src_min_lod:
++         min_lod = ir3_get_src(ctx, &tex->src[i].src)[0];
++         has_min_lod = true;
++         break;
+       case nir_tex_src_texture_offset:
+       case nir_tex_src_sampler_offset:
+       case nir_tex_src_texture_handle:
+@@ -3837,7 +3861,7 @@
+     *  - lod
+     *  - bias
+     */
+-   if (has_off | has_lod | has_bias) {
++   if (has_off | has_lod | has_bias | has_min_lod) {
+       if (has_off) {
+          unsigned off_coords = coords;
+          if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
+@@ -3851,6 +3875,11 @@
+ 
+       if (has_lod | has_bias)
+          src1[nsrc1++] = lod;
++
++      if (has_min_lod) {
++         src1[nsrc1++] = min_lod;
++         flags |= IR3_INSTR_CLP;
++      }
+    }
+ 
+    type = get_tex_dest_type(tex);
+@@ -3946,6 +3975,14 @@
+       sam = emit_sam(ctx, opc, info, type, MASK(ncomp), col0, col1);
+    }
+ 
++   if (tex->is_sparse) {
++      info.flags |= flags;
++      struct ir3_instruction *rck =
++         emit_sam(ctx, opc, info, TYPE_U32, MASK(1), col0, col1);
++      rck->flags |= IR3_INSTR_RCK;
++      dst[ncomp] = rck;
++   }
++
+    if (tg4_swizzle_fixup) {
+       /* TODO: fix-up for ASTC when alpha is selected? */
+       array_insert(ctx->ir, ctx->ir->tg4, sam);
+Index: src/freedreno/.gitlab-ci/reference/prefetch-test.log
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/.gitlab-ci/reference/prefetch-test.log b/src/freedreno/.gitlab-ci/reference/prefetch-test.log
+--- a/src/freedreno/.gitlab-ci/reference/prefetch-test.log	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/.gitlab-ci/reference/prefetch-test.log	(date 1738998728422)
+@@ -149161,7 +149161,7 @@
+ 	:0:0051:0063[19d70515x_81d857bex] no match: 19d7051581d857be
+ 	:3:0052:0064[7972f999x_e4df0ecbx] (sy)(ss)(jp)(rpt1)(ul)mad.s16 r38.y, (r)hc<a0.x + -309>, (neg)hr57.y, (neg)(r)(last)hr55.w
+ 	:6:0053:0066[dda7eb4fx_f96f6ddfx] no match: dda7eb4ff96f6ddf
+-	:5:0054:0067[a4e7fe75x_ab4ffb7fx] no match: a4e7fe75ab4ffb7f
++	:5:0054:0067[a4e7fe75x_ab4ffb7fx] gather4a.3d.a.p.s.clp.rck (yzw)r29.y, r47.w, r63.y, s#10, t#85	; dontcare bits in gather4a: 0000000000020000, WARNING: unexpected bits[19:20] in #instruction-cat5-tex-base: 0000000000000001 vs 0000000000000000, WARNING: unexpected bits[47:47] in #instruction-cat5: 0000000000000001 vs 0000000000000000
+ 	:6:0055:0068[d1937f77x_effcfeefx] no match: d1937f77effcfeef
+ 	:0:0056:0069[1134c8d0x_34200204x] (sy)jump #874512900	; dontcare bits in jump: 0034c8d000000000
+ 	:5:0057:0070[ac44c0eax_60215b2ex] (jp)gather4g.s (s16)()hr58.z, hr37.w, s#1, t#48	; WARNING: unexpected bits[47:47] in #instruction-cat5: 0000000000000001 vs 0000000000000000, WARNING: unexpected bits[0:7] in #cat5-src2: 00000000000000ad vs 0000000000000000
+Index: src/freedreno/fdl/fd6_tiled_memcpy.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/fdl/fd6_tiled_memcpy.cc b/src/freedreno/fdl/fd6_tiled_memcpy.cc
+--- a/src/freedreno/fdl/fd6_tiled_memcpy.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/fdl/fd6_tiled_memcpy.cc	(date 1738998728472)
+@@ -192,44 +192,67 @@
+       ((y & bank_mask) << bank_shift);
+ }
+ 
+-/* Figure out how y is swizzled into x based on the UBWC config and block
+- * stride and return values to be plugged into block_y_xormask().
++/* Figure out how y is swizzled into x based on the UBWC config and macrotile
++ * stride. get_bank_mask() returns a mask to be applied to the macrotile y
++ * offset, which is then shifted by get_bank_shift() to get the value to xor
++ * into the *byte* x offset.
+  */
+ 
+-static uint32_t
+-get_bank_mask(uint32_t block_stride, uint32_t cpp,
+-              const struct fdl_ubwc_config *config)
++uint32_t
++fdl6_get_bank_mask(const struct fdl_layout *layout, unsigned miplevel,
++                   const struct fdl_ubwc_config *config)
+ {
+    /* For some reason, for cpp=1 (or R8G8 media formats) the alignment
+     * required is doubled.
+     */
+-   unsigned offset = cpp == 1 ? 1 : 0;
++   unsigned offset = (fdl6_is_r8g8(layout) || layout->cpp == 1) ? 1 : 0;
++   uint32_t macrotile_width, macrotile_height;
++   fdl6_get_ubwc_macrotile_size(layout, &macrotile_width, &macrotile_height);
++   uint32_t macrotile_stride =
++      fdl_pitch(layout, miplevel) / (macrotile_width * layout->cpp);
+    uint32_t mask = 0;
+    if ((config->bank_swizzle_levels & 0x2) &&
+-       (block_stride & ((1u << (config->highest_bank_bit - 10 + offset)) - 1)) == 0)
+-      mask |= 0b100;
++       (macrotile_stride & ((1u << (config->highest_bank_bit - 12 + offset)) - 1)) == 0)
++      mask |= 0b1;
+    if ((config->bank_swizzle_levels & 0x4) &&
+-       (block_stride & ((1u << (config->highest_bank_bit - 9 + offset)) - 1)) == 0)
+-      mask |= 0b1000;
++       (macrotile_stride & ((1u << (config->highest_bank_bit - 11 + offset)) - 1)) == 0)
++      mask |= 0b10;
+    if ((config->bank_swizzle_levels & 0x1) &&
+-       (block_stride & ((1u << (config->highest_bank_bit - 8 + offset)) - 1)) == 0)
+-      mask |= 0b10000;
++       (macrotile_stride & ((1u << (config->highest_bank_bit - 10 + offset)) - 1)) == 0)
++      mask |= 0b100;
+    return mask;
+ }
+ 
++uint32_t
++fdl6_get_bank_shift(const struct fdl_ubwc_config *config)
++{
++   return config->highest_bank_bit - 1;
++}
++
++
++/* We compute the macrotile and block offset at once in block_y_xormask(), and
++ * work in terms of the block offset, so provide wrappers that work with a y
++ * block offset instead of macrotile offset to avoid extra instructions in a
++ * tight loop.
++ */
++static uint32_t
++get_bank_mask(const struct fdl_layout *layout, unsigned miplevel,
++              const struct fdl_ubwc_config *config)
++{
++   return fdl6_get_bank_mask(layout, miplevel, config) << 2;
++}
++
+ static uint32_t
+ get_bank_shift(const struct fdl_ubwc_config *config)
+ {
+-   return config->highest_bank_bit - 3;
++   return fdl6_get_bank_shift(config) - 2;
+ }
+ 
+ #if USE_SLOW_PATH
+ static uint32_t
+-get_block_offset(uint32_t x, uint32_t y, unsigned block_stride, unsigned cpp,
+-                 const struct fdl_ubwc_config *config)
++get_block_offset(uint32_t x, uint32_t y, unsigned macrotile_stride,
++                 uint32_t bank_mask, uint32_t bank_shift)
+ {
+-   uint32_t bank_mask = get_bank_mask(block_stride, cpp, config);
+-   unsigned bank_shift = get_bank_shift(config);
+    uint32_t x_mask, y_mask;
+    if (config->macrotile_mode == FDL_MACROTILE_4_CHANNEL) {
+       x_mask = block_x_xormask<FDL_MACROTILE_4_CHANNEL>(x, cpp);
+@@ -241,13 +264,13 @@
+                                                         bank_shift);
+    }
+    uint32_t macrotile_y = y >> 2;
+-   uint32_t macrotile_stride = block_stride / 2;
+-   return ((x_mask ^ y_mask) >> 8) + ((macrotile_y * macrotile_stride) << 3);
++   uint32_t half_macrotile_stride = macrotile_stride * 2;
++   return ((x_mask ^ y_mask) >> 8) + ((macrotile_y * half_macrotile_stride) << 3);
+ }
+ #endif
+ 
+ static void
+-get_block_size(unsigned cpp, uint32_t *block_width,
++get_block_size(unsigned cpp, bool r8g8, uint32_t *block_width,
+                uint32_t *block_height)
+ {
+    switch (cpp) {
+@@ -256,8 +279,13 @@
+       *block_height = 8;
+       break;
+    case 2:
+-      *block_width = 32;
+-      *block_height = 4;
++      if (r8g8) {
++         *block_width = 16;
++         *block_height = 8;
++      } else {
++         *block_width = 32;
++         *block_height = 4;
++      }
+       break;
+    case 4:
+       *block_width = 16;
+@@ -271,11 +299,25 @@
+       *block_width = 4;
+       *block_height = 4;
+       break;
++   case 32:
++      *block_width = 4;
++      *block_height = 2;
+    default:
+       unreachable("unknown cpp");
+    }
+ }
+ 
++void 
++fdl6_get_ubwc_macrotile_size(const struct fdl_layout *layout,
++                             uint32_t *macrotile_width,
++                             uint32_t *macrotile_height)
++{
++   uint32_t block_width, block_height;
++   get_block_size(layout->cpp, fdl6_is_r8g8(layout), &block_width, &block_height);
++   *macrotile_width = block_width * 4;
++   *macrotile_height = block_height * 4;
++}
++
+ enum copy_dir {
+    LINEAR_TO_TILED,
+    TILED_TO_LINEAR,
+@@ -287,20 +329,21 @@
+ memcpy_small(uint32_t x_start, uint32_t y_start,
+              uint32_t width, uint32_t height,
+              char *tiled, char *linear,
+-             uint32_t linear_pitch, uint32_t block_stride,
+-             const struct fdl_ubwc_config *config)
++             uint32_t linear_pitch, uint32_t macrotile_stride,
++             uint32_t bank_mask, uint32_t bank_shift)
+ {
+    unsigned block_width, block_height;
+-   get_block_size(cpp, &block_width, &block_height);
++   get_block_size(cpp, false, &block_width, &block_height);
+    const uint32_t block_size = 256;
+ 
+-   uint32_t bank_mask = get_bank_mask(block_stride, cpp, config);
+-   uint32_t bank_shift = get_bank_shift(config);
+    uint32_t x_mask = (get_pixel_offset(~0u, 0)) & (block_size / cpp - 1);
+    uint32_t y_mask = (get_pixel_offset(0, ~0u)) & (block_size / cpp - 1);
+ 
+-   /* The pitch between vertically adjacent 2K macrotiles. */
+-   uint32_t macrotile_pitch = (block_stride / 2) * 2048;
++   /* The pitch between vertically adjacent macrotiles. Note that this is the
++    * same for 4K macrotiles and the 2K half-macrotiles we use to simplify the
++    * address calculations, because they have the same height.
++    */
++   uint32_t macrotile_pitch = macrotile_stride * 4096;
+ 
+    uint32_t x_block_start = x_start / block_width;
+    uint32_t y_block_start = y_start / block_height;
+@@ -362,15 +405,6 @@
+ typedef uint8_t pixel16_t __attribute__((vector_size(16), aligned(16)));
+ typedef uint8_t pixel16a1_t __attribute__((vector_size(16), aligned(1)));
+ 
+-/* We use memcpy_small as a fallback for copying a tile when there isn't
+- * optimized assembly, which requires a config, but because we're just copying
+- * a tile it doesn't matter which config we pass. Just pass an arbitrary valid
+- * config.
+- */
+-static const struct fdl_ubwc_config dummy_config = {
+-   .highest_bank_bit = 13,
+-};
+-
+ /* We use handwritten assembly for the smaller cpp's because gcc is too dumb
+  * to register allocate the vector registers without inserting extra moves,
+  * and it can't use the post-increment register mode so it emits too many add
+@@ -412,7 +446,7 @@
+    }
+ #else
+    memcpy_small<1, LINEAR_TO_TILED, FDL_MACROTILE_4_CHANNEL>(
+-      0, 0, 32, 8, _tiled, _linear, linear_pitch, 0, &dummy_config);
++      0, 0, 32, 8, _tiled, _linear, linear_pitch, 0, 0, 0);
+ #endif
+ }
+ 
+@@ -450,7 +484,7 @@
+    }
+ #else
+    memcpy_small<1, TILED_TO_LINEAR, FDL_MACROTILE_4_CHANNEL>(
+-      0, 0, 32, 8, _tiled, _linear, linear_pitch, 0, &dummy_config);
++      0, 0, 32, 8, _tiled, _linear, linear_pitch, 0, 0, 0);
+ #endif
+ }
+ 
+@@ -488,7 +522,7 @@
+    }
+ #else
+    memcpy_small<2, LINEAR_TO_TILED, FDL_MACROTILE_4_CHANNEL>(
+-      0, 0, 32, 4, _tiled, _linear, linear_pitch, 0, &dummy_config);
++      0, 0, 32, 4, _tiled, _linear, linear_pitch, 0, 0, 0);
+ #endif
+ }
+ 
+@@ -526,7 +560,7 @@
+    }
+ #else
+    memcpy_small<2, LINEAR_TO_TILED, FDL_MACROTILE_4_CHANNEL>(
+-      0, 0, 32, 4, _tiled, _linear, linear_pitch, 0, &dummy_config);
++      0, 0, 32, 4, _tiled, _linear, linear_pitch, 0, 0, 0);
+ #endif
+ }
+ 
+@@ -736,11 +770,11 @@
+ memcpy_large(uint32_t x_start, uint32_t y_start,
+              uint32_t width, uint32_t height,
+              char *tiled, char *linear,
+-             uint32_t linear_pitch, uint32_t block_stride,
+-             const fdl_ubwc_config *config)
++             uint32_t linear_pitch, uint32_t macrotile_stride,
++             uint32_t bank_mask, uint32_t bank_shift)
+ {
+    unsigned block_width, block_height;
+-   get_block_size(cpp, &block_width, &block_height);
++   get_block_size(cpp, false, &block_width, &block_height);
+ 
+    /* The region to copy is divided into 9 parts:
+     *
+@@ -773,7 +807,7 @@
+    if (x_aligned_end <= x_aligned_start || y_aligned_end <= y_aligned_start) {
+       memcpy_small<cpp, direction, macrotile_mode>(
+          x_start, y_start, width, height, tiled, linear, linear_pitch,
+-         block_stride, config);
++         macrotile_stride, bank_mask, bank_shift);
+       return;
+    }
+ 
+@@ -781,7 +815,7 @@
+    if (y_start != y_aligned_start) {
+       memcpy_small<cpp, direction, macrotile_mode>(
+          x_start, y_start, width, y_aligned_start - y_start, tiled, linear,
+-         linear_pitch, block_stride, config);
++         linear_pitch, macrotile_stride, bank_mask, bank_shift);
+       linear += (y_aligned_start - y_start) * linear_pitch;
+    }
+ 
+@@ -791,14 +825,12 @@
+       memcpy_small<cpp, direction, macrotile_mode>(
+          x_start, y_aligned_start, x_aligned_start - x_start,
+          y_aligned_end - y_aligned_start, tiled, linear, linear_pitch,
+-         block_stride, config);
++         macrotile_stride, bank_mask, bank_shift);
+       linear_aligned = linear + (x_aligned_start - x_start) * cpp;
+    }
+ 
+    /* Handle the main part */
+-   uint32_t macrotile_pitch = (block_stride / 2) * 2048;
+-   uint32_t bank_mask = get_bank_mask(block_stride, cpp, config);
+-   uint32_t bank_shift = get_bank_shift(config);
++   uint32_t macrotile_pitch = macrotile_stride * 4096;
+    char *tiled_aligned =
+       tiled + macrotile_pitch * (y_aligned_start / (block_height * 4));
+ 
+@@ -830,7 +862,7 @@
+       memcpy_small<cpp, direction, macrotile_mode>(
+          x_aligned_end, y_aligned_start, x_end - x_aligned_end,
+          y_aligned_end - y_aligned_start, tiled, linear_end, linear_pitch,
+-         block_stride, config);
++         macrotile_stride, bank_mask, bank_shift);
+    }
+ 
+    /* Handle the bottom third */
+@@ -838,8 +870,8 @@
+    if (y_end != y_aligned_end) {
+       memcpy_small<cpp, direction, macrotile_mode>(
+          x_start, y_aligned_end, width, y_end - y_aligned_end,
+-         tiled, linear, linear_pitch, block_stride,
+-         config);
++         tiled, linear, linear_pitch, macrotile_stride,
++         bank_mask, bank_shift);
+    }
+ }
+ 
+@@ -854,9 +886,11 @@
+ {
+    unsigned block_width, block_height;
+    uint32_t cpp = dst_layout->cpp;
+-   get_block_size(cpp, &block_width, &block_height);
+-   uint32_t block_stride =
+-      fdl_pitch(dst_layout, dst_miplevel) / (block_width * dst_layout->cpp);
++   get_block_size(cpp, false, &block_width, &block_height);
++   uint32_t macrotile_stride =
++      fdl_pitch(dst_layout, dst_miplevel) / (4 * block_width * dst_layout->cpp);
++   uint32_t bank_mask = get_bank_mask(dst_layout, dst_miplevel, config);
++   uint32_t bank_shift = get_bank_shift(config);
+    uint32_t block_size = 256;
+    assert(block_size == block_width * block_height * dst_layout->cpp);
+    assert(config->macrotile_mode != FDL_MACROTILE_INVALID);
+@@ -870,8 +904,8 @@
+          uint32_t x_pixel = (x + x_start) % block_width;
+ 
+          uint32_t block_offset = 
+-            get_block_offset(x_block, y_block, block_stride, cpp,
+-                             config);
++            get_block_offset(x_block, y_block, macrotile_stride, bank_mask,
++                             bank_shift);
+          uint32_t pixel_offset = get_pixel_offset(x_pixel, y_pixel);
+ 
+          memcpy(dst + block_size * block_offset + cpp * pixel_offset,
+@@ -886,12 +920,12 @@
+          memcpy_large<case_cpp, LINEAR_TO_TILED,                              \
+             linear_to_tiled_##case_cpp##cpp, FDL_MACROTILE_4_CHANNEL>(        \
+             x_start, y_start, width, height, dst, (char *)src, src_pitch,     \
+-            block_stride, config);                                            \
++            macrotile_stride, bank_mask, bank_shift);                         \
+       } else {                                                                \
+          memcpy_large<case_cpp, LINEAR_TO_TILED,                              \
+             linear_to_tiled_##case_cpp##cpp,  FDL_MACROTILE_8_CHANNEL>(       \
+             x_start, y_start, width, height, dst, (char *)src, src_pitch,     \
+-            block_stride, config);                                            \
++            macrotile_stride, bank_mask, bank_shift);                         \
+       }                                                                       \
+       break;
+    CASE(1)
+@@ -917,9 +951,11 @@
+ {
+    unsigned block_width, block_height;
+    unsigned cpp = src_layout->cpp;
+-   get_block_size(cpp, &block_width, &block_height);
+-   uint32_t block_stride =
+-      fdl_pitch(src_layout, src_miplevel) / (block_width * src_layout->cpp);
++   get_block_size(cpp, false, &block_width, &block_height);
++   uint32_t macrotile_stride =
++      fdl_pitch(src_layout, src_miplevel) / (4 * block_width * src_layout->cpp);
++   uint32_t bank_mask = get_bank_mask(src_layout, src_miplevel, config);
++   uint32_t bank_shift = get_bank_shift(config);
+    uint32_t block_size = 256;
+    assert(block_size == block_width * block_height * src_layout->cpp);
+    assert(config->macrotile_mode != FDL_MACROTILE_INVALID);
+@@ -933,8 +969,8 @@
+          uint32_t x_pixel = (x + x_start) % block_width;
+ 
+ 	 uint32_t block_offset =
+-            get_block_offset(x_block, y_block, block_stride, src_layout->cpp,
+-                             config);
++            get_block_offset(x_block, y_block, macrotile_stride,
++                             src_layout->cpp, bank_mask, bank_shift);
+ 	 uint32_t pixel_offset = get_pixel_offset(x_pixel, y_pixel);
+ 
+          memcpy(dst + y * dst_pitch + x * src_layout->cpp,
+@@ -950,12 +986,12 @@
+          memcpy_large<case_cpp, TILED_TO_LINEAR,                              \
+             tiled_to_linear_##case_cpp##cpp, FDL_MACROTILE_4_CHANNEL>(        \
+             x_start, y_start, width, height, (char *)src, dst, dst_pitch,     \
+-            block_stride, config);                                            \
++            macrotile_stride, bank_mask, bank_shift);                         \
+       } else {                                                                \
+          memcpy_large<case_cpp, TILED_TO_LINEAR,                              \
+             tiled_to_linear_##case_cpp##cpp, FDL_MACROTILE_8_CHANNEL>(        \
+             x_start, y_start, width, height, (char *)src, dst, dst_pitch,     \
+-            block_stride, config);                                            \
++            macrotile_stride, bank_mask, bank_shift);                         \
+       }                                                                       \
+       break;
+    CASE(1)
+Index: src/freedreno/.gitlab-ci/reference/crash.log
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/.gitlab-ci/reference/crash.log b/src/freedreno/.gitlab-ci/reference/crash.log
+--- a/src/freedreno/.gitlab-ci/reference/crash.log	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/.gitlab-ci/reference/crash.log	(date 1738998728117)
+@@ -3408,7 +3408,7 @@
+ 	:7:0001:0001[edc6145bx_11fa09c3x] no match: edc6145b11fa09c3
+ 	:2:0002:0002[41440087x_008c504ax] ceil.f hr33.w, (neg)hc18.z	; dontcare bits in ceil.f: 00040000008c0000
+ 	:0:0003:0003[14183488x_d5c04509x] no match: 14183488d5c04509
+-	:5:0004:0004[a52373bdx_8ff7c071x] no match: a52373bd8ff7c071
++	:5:0004:0004[a52373bdx_8ff7c071x] samgp0.3d.a.p.clp.rck (xy)r47.y, r14.x, r56.x, s#15, t#71	; dontcare bits in samgp0: 0000000000020000, WARNING: unexpected bits[19:20] in #instruction-cat5-tex-base: 0000000000000002 vs 0000000000000000
+ 	:1:0005:0005[39301c43x_1d826d16x] no match: 39301c431d826d16
+ 	-----------------------------------------------
+ 	8192 (0x2000) bytes
+Index: src/freedreno/drm/msm/msm_ringbuffer.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/drm/msm/msm_ringbuffer.c b/src/freedreno/drm/msm/msm_ringbuffer.c
+--- a/src/freedreno/drm/msm/msm_ringbuffer.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/drm/msm/msm_ringbuffer.c	(date 1738998728442)
+@@ -132,7 +132,7 @@
+             (struct drm_msm_gem_submit_bo){
+                .flags = bo->reloc_flags & (MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE),
+                .handle = bo->handle,
+-               .presumed = 0,
++               .address = 0,
+             });
+          APPEND(submit, bos, fd_bo_ref(bo));
+ 
+Index: src/freedreno/drm/msm/msm_ringbuffer_sp.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/drm/msm/msm_ringbuffer_sp.c b/src/freedreno/drm/msm/msm_ringbuffer_sp.c
+--- a/src/freedreno/drm/msm/msm_ringbuffer_sp.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/drm/msm/msm_ringbuffer_sp.c	(date 1738998728448)
+@@ -119,7 +119,7 @@
+    for (unsigned i = 0; i < fd_submit->nr_bos; i++) {
+       submit_bos[i].flags = fd_submit->bos[i]->reloc_flags;
+       submit_bos[i].handle = fd_submit->bos[i]->handle;
+-      submit_bos[i].presumed = 0;
++      submit_bos[i].address = 0;
+    }
+ 
+    req.bos = VOID2U64(submit_bos);
+Index: src/gallium/drivers/freedreno/a6xx/fd6_resource.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_resource.cc b/src/gallium/drivers/freedreno/a6xx/fd6_resource.cc
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_resource.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_resource.cc	(date 1738998834698)
+@@ -256,7 +256,8 @@
+ 
+    fdl6_layout(&rsc->layout, screen->info, prsc->format, fd_resource_nr_samples(prsc),
+                prsc->width0, prsc->height0, prsc->depth0, prsc->last_level + 1,
+-               prsc->array_size, prsc->target == PIPE_TEXTURE_3D, false, NULL);
++               prsc->array_size, prsc->target == PIPE_TEXTURE_3D, false,
++               false, NULL);
+ 
+    if (!FD_DBG(NOLRZ) && has_depth(prsc->format) && !is_z32(prsc->format))
+       setup_lrz<CHIP>(rsc);
+@@ -282,7 +283,8 @@
+ 
+    if (!fdl6_layout(&rsc->layout, screen->info, prsc->format, fd_resource_nr_samples(prsc),
+                     prsc->width0, prsc->height0, prsc->depth0,
+-                    prsc->last_level + 1, prsc->array_size, false, false, &l))
++                    prsc->last_level + 1, prsc->array_size, false, false,
++                    false, &l))
+       return -1;
+ 
+    if (rsc->layout.size > fd_bo_size(rsc->bo))
+Index: src/freedreno/ir3/ir3_print.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/ir3/ir3_print.c b/src/freedreno/ir3/ir3_print.c
+--- a/src/freedreno/ir3/ir3_print.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/ir3/ir3_print.c	(date 1738998728590)
+@@ -192,6 +192,10 @@
+          mesa_log_stream_printf(stream, ".a1en");
+       if (instr->flags & IR3_INSTR_U)
+          mesa_log_stream_printf(stream, ".u");
++      if (instr->flags & IR3_INSTR_RCK)
++         mesa_log_stream_printf(stream, ".rck");
++      if (instr->flags & IR3_INSTR_CLP)
++         mesa_log_stream_printf(stream, ".clp");
+       if (instr->opc == OPC_LDC)
+          mesa_log_stream_printf(stream, ".offset%d", instr->cat6.d);
+       if (instr->opc == OPC_LDC_K)
+Index: src/freedreno/vulkan/tu_image.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+--- a/src/freedreno/vulkan/tu_image.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_image.cc	(date 1738998728715)
+@@ -21,6 +21,8 @@
+ #include "drm-uapi/drm_fourcc.h"
+ #include "vulkan/vulkan_core.h"
+ 
++#include "fdl/freedreno_layout.h"
++
+ #include "tu_buffer.h"
+ #include "tu_cs.h"
+ #include "tu_descriptor_set.h"
+@@ -120,7 +122,7 @@
+    }
+ }
+ 
+-static bool
++bool
+ tu_is_r8g8(enum pipe_format format)
+ {
+    return (util_format_get_blocksize(format) == 2) &&
+@@ -334,6 +336,7 @@
+ ubwc_possible(struct tu_device *device,
+               VkFormat format,
+               VkImageType type,
++              VkImageCreateFlags flags,
+               VkImageUsageFlags usage,
+               VkImageUsageFlags stencil_usage,
+               const struct fd_dev_info *info,
+@@ -341,6 +344,13 @@
+               uint32_t mip_levels,
+               bool use_z24uint_s8uint)
+ {
++   /* UBWC isn't possible with sparse residency, because unbound blocks may
++    * have leftover fast-clear data and therefore may show up as non-zero.
++    * TODO: Enable UBWC if nonResidentStrict isn't enabled.
++    */
++   if (flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)
++      return false;
++
+    /* no UBWC with compressed formats, E5B9G9R9, S8_UINT
+     * (S8_UINT because separate stencil doesn't have UBWC-enable bit)
+     */
+@@ -429,8 +439,8 @@
+  * formats that would normally be compatible (like R16), and so if we are
+  * trying to, for example, sample R16 as R8G8 we need to demote to linear.
+  */
+-static bool
+-format_list_reinterprets_r8g8_r16(enum pipe_format format, const VkImageFormatListCreateInfo *fmt_list)
++bool
++tu_format_list_reinterprets_r8g8_r16(enum pipe_format format, const VkImageFormatListCreateInfo *fmt_list)
+ {
+    /* Check if it's actually a 2-cpp color format. */
+    if (!tu_is_r8g8_compatible(format))
+@@ -513,6 +523,12 @@
+       tile_mode = TILE6_LINEAR;
+    }
+ 
++   /* We cannot support sparse residency with linear images, it should've been
++    * rejected.
++    */
++   assert(!(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) ||
++          tile_mode == TILE6_3);
++
+    for (uint32_t i = 0; i < tu6_plane_count(image->vk.format); i++) {
+       struct fdl_layout *layout = &image->layout[i];
+       enum pipe_format format = tu6_plane_format(image->vk.format, i);
+@@ -548,6 +564,7 @@
+                        image->vk.array_layers,
+                        image->vk.image_type == VK_IMAGE_TYPE_3D,
+                        image->is_mutable,
++                       image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
+                        plane_layouts ? &plane_layout : NULL)) {
+          assert(plane_layouts); /* can only fail with explicit layout */
+          return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+@@ -603,10 +620,10 @@
+ 
+    for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
+       if (!ubwc_possible(dev, fmt_list->pViewFormats[i],
+-                         create_info->imageType, create_info->usage,
+-                         create_info->usage, dev->physical_device->info,
+-                         create_info->samples, create_info->mipLevels,
+-                         dev->use_z24uint_s8uint))
++                         create_info->imageType, create_info->flags,
++                         create_info->usage, create_info->usage,
++                         dev->physical_device->info, create_info->samples,
++                         create_info->mipLevels, dev->use_z24uint_s8uint))
+          return false;
+    }
+ 
+@@ -661,7 +678,8 @@
+ 
+    if (image->force_linear_tile ||
+        !ubwc_possible(device, image->vk.format, pCreateInfo->imageType,
+-                      pCreateInfo->usage, image->vk.stencil_usage,
++                      pCreateInfo->flags, pCreateInfo->usage,
++                      image->vk.stencil_usage,
+                       device->physical_device->info, pCreateInfo->samples,
+                       pCreateInfo->mipLevels, device->use_z24uint_s8uint))
+       image->ubwc_enabled = false;
+@@ -724,7 +742,7 @@
+                image->ubwc_enabled = false;
+             }
+ 
+-            bool r8g8_r16 = format_list_reinterprets_r8g8_r16(vk_format_to_pipe_format(image->vk.format), fmt_list);
++            bool r8g8_r16 = tu_format_list_reinterprets_r8g8_r16(vk_format_to_pipe_format(image->vk.format), fmt_list);
+             bool fmt_list_has_swaps = format_list_has_swaps(fmt_list);
+ 
+             if (r8g8_r16 || fmt_list_has_swaps) {
+@@ -846,6 +864,24 @@
+       if (result != VK_SUCCESS)
+          goto fail;
+    }
++
++   if (pCreateInfo->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
++      struct tu_instance *instance = device->physical_device->instance;
++      BITMASK_ENUM(tu_sparse_vma_flags) flags = 0;
++
++      if (pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT)
++         flags |= TU_SPARSE_VMA_MAP_ZERO;
++
++      result = tu_sparse_vma_init(device, &image->vk.base, &image->vma,
++                                  &image->iova, flags, image->total_size, 0);
++
++      if (result != VK_SUCCESS)
++         goto fail;
++
++      vk_address_binding_report(&instance->vk, &image->vk.base,
++                                image->iova, image->total_size,
++                                VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
++   }
+ 
+    TU_RMV(image_create, device, image);
+ 
+@@ -879,6 +915,10 @@
+    tu_perfetto_log_destroy_image(device, image);
+ #endif
+ 
++   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
++      tu_sparse_vma_finish(device, &image->vma);
++   }
++
+    if (image->iova)
+       vk_address_binding_report(&instance->vk, &image->vk.base,
+                                 image->iova, image->total_size,
+@@ -992,9 +1032,19 @@
+ tu_get_image_memory_requirements(struct tu_device *dev, struct tu_image *image,
+                                  VkMemoryRequirements2 *pMemoryRequirements)
+ {
++   uint32_t alignment = image->layout[0].base_align;
++   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
++      alignment = MAX2(alignment, os_page_size);
++   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)
++      alignment = 65536;
++
+    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
+-      .size = image->total_size,
+-      .alignment = image->layout[0].base_align,
++      /* Due to how we fake the sparse tile size, the real size may not be
++       * aligned. CTS doesn't like this, and real apps may also be surprised,
++       * so we align it.
++       */
++      .size = align64(image->total_size, alignment),
++      .alignment = alignment,
+       .memoryTypeBits = (1 << dev->physical_device->memory.type_count) - 1,
+    };
+ 
+@@ -1014,6 +1064,132 @@
+    }
+ }
+ 
++
++static VkSparseImageFormatProperties
++tu_fill_sparse_image_fmt_props(VkImageAspectFlags aspects,
++                               const enum pipe_format format,
++                               VkSampleCountFlags samples)
++{
++   uint32_t width, height;
++   fdl_get_sparse_block_size(format, samples, &width, &height);
++
++   VkSparseImageFormatProperties sparse_format_props = {
++      .aspectMask = aspects,
++      .imageGranularity = {
++         .width = width * util_format_get_blockwidth(format),
++         .height = height * util_format_get_blockheight(format),
++         .depth = 1,
++      },
++      .flags = 0,
++   };
++
++   return sparse_format_props;
++}
++
++VKAPI_ATTR void VKAPI_CALL
++tu_GetPhysicalDeviceSparseImageFormatProperties2(
++    VkPhysicalDevice physicalDevice,
++    const VkPhysicalDeviceSparseImageFormatInfo2* pFormatInfo,
++    uint32_t *pPropertyCount,
++    VkSparseImageFormatProperties2 *pProperties)
++{
++   VkResult result;
++
++   /* Check if the given format info is valid first before returning sparse
++    * props.  The easiest way to do this is to just call
++    * tu_GetPhysicalDeviceImageFormatProperties2()
++    */
++   const VkPhysicalDeviceImageFormatInfo2 img_fmt_info = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
++      .format = pFormatInfo->format,
++      .type = pFormatInfo->type,
++      .tiling = pFormatInfo->tiling,
++      .usage = pFormatInfo->usage,
++      .flags = VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
++               VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
++   };
++
++   VkImageFormatProperties2 img_fmt_props2 = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
++      .pNext = NULL,
++   };
++
++   result = tu_GetPhysicalDeviceImageFormatProperties2(physicalDevice,
++                                                       &img_fmt_info,
++                                                       &img_fmt_props2);
++   if (result != VK_SUCCESS) {
++      *pPropertyCount = 0;
++      return;
++   }
++
++   const VkImageFormatProperties *props = &img_fmt_props2.imageFormatProperties;
++   if (!(pFormatInfo->samples & props->sampleCounts)) {
++      *pPropertyCount = 0;
++      return;
++   }
++
++   /* We should already reject non-2D images */
++   assert(pFormatInfo->type == VK_IMAGE_TYPE_2D);
++
++   VK_OUTARRAY_MAKE_TYPED(VkSparseImageFormatProperties2, out,
++                          pProperties, pPropertyCount);
++
++   VkImageAspectFlags aspects = vk_format_aspects(pFormatInfo->format);
++   const enum pipe_format pipe_format =
++      vk_format_to_pipe_format(pFormatInfo->format);
++
++   vk_outarray_append_typed(VkSparseImageFormatProperties2, &out, props) {
++      props->properties = tu_fill_sparse_image_fmt_props(aspects, pipe_format,
++                                                         pFormatInfo->samples);
++   }
++}
++
++static VkSparseImageMemoryRequirements
++tu_fill_sparse_image_memory_reqs(const struct fdl_layout *layout,
++                                 VkImageAspectFlags aspects)
++{
++   VkSparseImageFormatProperties sparse_format_props =
++      tu_fill_sparse_image_fmt_props(aspects,
++                                     layout->format,
++                                     layout->nr_samples);
++
++   VkSparseImageMemoryRequirements sparse_memory_reqs = {
++      .formatProperties = sparse_format_props,
++      .imageMipTailFirstLod = layout->mip_tail_first_lod,
++      .imageMipTailSize = fdl_sparse_miptail_size(layout),
++      .imageMipTailOffset = fdl_sparse_miptail_offset(layout),
++      .imageMipTailStride = layout->layer_size,
++   };
++
++   return sparse_memory_reqs;
++}
++
++static void
++tu_get_image_sparse_memory_requirements(
++   struct tu_device *dev,
++   struct tu_image *image,
++   uint32_t *pSparseMemoryRequirementCount,
++   VkSparseImageMemoryRequirements2 *pMemoryRequirements)
++{
++   VK_OUTARRAY_MAKE_TYPED(VkSparseImageMemoryRequirements2, out,
++                          pMemoryRequirements, pSparseMemoryRequirementCount);
++
++   /* From the Vulkan 1.3.279 spec:
++    *
++    *    "The sparse image must have been created using the
++    *    VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT flag to retrieve valid sparse
++    *    image memory requirements."
++    */
++   if (!(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT))
++      return;
++
++   vk_outarray_append_typed(VkSparseImageMemoryRequirements2, &out, reqs) {
++      reqs->memoryRequirements =
++         tu_fill_sparse_image_memory_reqs(&image->layout[0],
++                                          image->vk.aspects);
++   };
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ tu_GetImageMemoryRequirements2(VkDevice _device,
+                                const VkImageMemoryRequirementsInfo2 *pInfo,
+@@ -1027,12 +1203,17 @@
+ 
+ VKAPI_ATTR void VKAPI_CALL
+ tu_GetImageSparseMemoryRequirements2(
+-   VkDevice device,
++   VkDevice _device,
+    const VkImageSparseMemoryRequirementsInfo2 *pInfo,
+    uint32_t *pSparseMemoryRequirementCount,
+    VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
+ {
+-   tu_stub();
++   VK_FROM_HANDLE(tu_device, device, _device);
++   VK_FROM_HANDLE(tu_image, image, pInfo->image);
++
++   tu_get_image_sparse_memory_requirements(device, image,
++                                           pSparseMemoryRequirementCount,
++                                           pSparseMemoryRequirements);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1054,12 +1235,22 @@
+ 
+ VKAPI_ATTR void VKAPI_CALL
+ tu_GetDeviceImageSparseMemoryRequirements(
+-    VkDevice device,
++    VkDevice _device,
+     const VkDeviceImageMemoryRequirements *pInfo,
+     uint32_t *pSparseMemoryRequirementCount,
+     VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
+ {
+-   tu_stub();
++   VK_FROM_HANDLE(tu_device, device, _device);
++
++   struct tu_image image = {0};
++
++   vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
++   tu_image_init(device, &image, pInfo->pCreateInfo);
++   TU_CALLX(device, tu_image_update_layout)(device, &image, DRM_FORMAT_MOD_INVALID, NULL);
++
++   tu_get_image_sparse_memory_requirements(device, &image,
++                                           pSparseMemoryRequirementCount,
++                                           pSparseMemoryRequirements);
+ }
+ 
+ static void
+@@ -1193,3 +1384,112 @@
+       pixel = (char *)pixel + fdm->view.layer_size;
+    }
+ }
++
++/* The native macrotile size is 4K, and the page size is also 4K, so the
++ * most natural thing would be to expose 4K tiles. But that isn't compatible
++ * with D3D requirements, so we have to emulate 64K "sparse tiles" on the
++ * native 4K macrotiles.
++ *
++ * Each "sparse tile" contains macrotiles in the natural linear order. We have
++ * to do this in order to guarantee that aliasing tiles in different images
++ * works. One tricky case is when the stride isn't aligned to the sparse tile
++ * width, or the height isn't aligned to the sparse height: at the bottom or
++ * left edges there may be HW tiles inside the sparse tile that overhang the
++ * image and don't have any corresponding backing memory, and we have to skip
++ * mapping/unmapping those.
++ *
++ * When doing the mapping, we have to be aware of bank swizzling. It may
++ * reorder macrotiles inside a sparse tile, or it may reorder sparse tiles, or
++ * both, depending on the highest bank bit and alignment. In the first case,
++ * we need to swizzle the macrotiles when mapping, to ensure that aliasing
++ * works.
++ */
++void
++tu_bind_sparse_image(struct tu_device *device, void *submit,
++                     struct tu_image *image,
++                     const VkSparseImageMemoryBind *bind)
++{
++   VK_FROM_HANDLE(tu_device_memory, mem, bind->memory);
++   struct tu_bo *bo = mem ? mem->bo : NULL;
++   uint64_t bo_offset = mem ? bind->memoryOffset : 0;
++   uint32_t sparse_width, sparse_height;
++   uint32_t macrotile_width, macrotile_height;
++   fdl_get_sparse_block_size(image->layout[0].format,
++                             image->layout[0].nr_samples,
++                             &sparse_width, &sparse_height);
++   fdl6_get_ubwc_macrotile_size(&image->layout[0],
++                                &macrotile_width, &macrotile_height);
++   assert(sparse_width % macrotile_width == 0);
++   assert(sparse_height % macrotile_height == 0);
++
++   uint32_t blockwidth = util_format_get_blockwidth(image->layout[0].format);
++   uint32_t blockheight = util_format_get_blockwidth(image->layout[0].format);
++   uint32_t x_start = bind->offset.x / blockwidth;
++   uint32_t x_end = DIV_ROUND_UP(bind->offset.x + bind->extent.width,
++                                 blockwidth);
++   uint32_t y_start = bind->offset.y / blockheight;
++   uint32_t y_end = DIV_ROUND_UP(bind->offset.y + bind->extent.height,
++                                 blockheight);
++   uint32_t cpp = image->layout[0].cpp;
++   uint32_t pitch = fdl_pitch(&image->layout[0], bind->subresource.mipLevel);
++   uint64_t image_offset = fdl_surface_offset(&image->layout[0],
++                                              bind->subresource.mipLevel,
++                                              bind->subresource.arrayLayer);
++   uint32_t bank_mask = fdl6_get_bank_mask(&image->layout[0],
++                                           bind->subresource.mipLevel,
++                                           &device->physical_device->ubwc_config);
++   uint32_t bank_shift =
++      fdl6_get_bank_shift(&device->physical_device->ubwc_config);
++
++   /* Our y offset is in pixels */
++   bank_mask *= macrotile_height;
++   bank_shift -= util_logbase2(macrotile_height);
++
++   uint64_t prev_image_offset = 0;
++   uint64_t prev_bo_offset = 0;
++   uint64_t bind_range = 0;
++
++   for (unsigned sy = y_start; sy < y_end; sy += sparse_height) {
++      for (unsigned sx = x_start; sx < x_end; sx += sparse_width,
++           bo_offset += 65536) {
++         uint64_t row_bo_offset = bo_offset;
++         for (unsigned ty = sy; ty < MIN2(sy + sparse_height, y_end);
++              ty += macrotile_height,
++              row_bo_offset += sparse_width * macrotile_height * cpp) {
++            uint64_t row_image_offset = image_offset + pitch * ty;
++            uint32_t x_swizzle = (ty & bank_mask) << bank_shift;
++            uint64_t column_bo_offset = row_bo_offset;
++            for (unsigned tx = sx; tx < MIN2(sx + sparse_width, x_end);
++                 tx += macrotile_width, column_bo_offset += 4096) {
++               uint64_t image_offset =
++                  ((tx * macrotile_height * image->layout[0].cpp) ^ x_swizzle) + row_image_offset;
++
++               /* Try to combine consecutive binds. In most cases, depending
++                * on the x_swizzle, we should be able to map the whole row of
++                * the sparse tile at once.
++                */
++               if (!bind_range) {
++                  prev_image_offset = image_offset;
++                  prev_bo_offset = bo ? column_bo_offset : 0;
++                  bind_range = 4096;
++               } else if (prev_image_offset + bind_range == image_offset &&
++                          (!bo || prev_bo_offset + bind_range == bo_offset)) {
++                  bind_range += 4096;
++               } else {
++                  tu_submit_add_bind(device, submit, &image->vma,
++                                     prev_image_offset, bo, prev_bo_offset,
++                                     bind_range);
++                  prev_image_offset = image_offset;
++                  prev_bo_offset = bo ? column_bo_offset : 0;
++                  bind_range = 4096;
++               }
++            }
++         }
++      }
++   }
++
++   if (bind_range) {
++      tu_submit_add_bind(device, submit, &image->vma, prev_image_offset, bo,
++                         prev_bo_offset, bind_range);
++   }
++}
+Index: src/freedreno/vulkan/tu_knl_drm_msm.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc	(date 1738998728759)
+@@ -126,6 +126,20 @@
+    return true;
+ }
+ 
++static int
++tu_try_enable_vm_bind(int fd)
++{
++   struct drm_msm_param param_req = {
++      .pipe = MSM_PIPE_3D0,
++      .param = MSM_PARAM_EN_VM_BIND,
++      .value = 1,
++   };
++
++   int ret = drmCommandWriteRead(fd, DRM_MSM_SET_PARAM, &param_req,
++                                 sizeof(param_req));
++   return ret;
++}
++
+ static uint32_t
+ tu_drm_get_priorities(const struct tu_physical_device *dev)
+ {
+@@ -198,7 +212,32 @@
+             "failed to open device %s", dev->physical_device->fd_path);
+    }
+ 
+-   int ret = tu_drm_get_param(fd, MSM_PARAM_FAULTS, &dev->fault_count);
++   int ret;
++   if (dev->physical_device->has_sparse) {
++      ret = tu_try_enable_vm_bind(fd);
++      if (ret != 0) {
++         return vk_startup_errorf(dev->physical_device->instance,
++                                  VK_ERROR_INITIALIZATION_FAILED,
++                                  "Failed to enable VM_BIND mode: %d", ret);
++      }
++
++      struct drm_msm_submitqueue submit_req = {
++         .flags = MSM_SUBMITQUEUE_VM_BIND,
++      };
++
++      ret = drmCommandWriteRead(fd, DRM_MSM_SUBMITQUEUE_NEW, &submit_req,
++                                sizeof(submit_req));
++      if (ret != 0) {
++         close(fd);
++         return vk_startup_errorf(dev->physical_device->instance,
++                                  VK_ERROR_INITIALIZATION_FAILED,
++                                  "Failed to create VM_BIND queue: %d", ret);
++      }
++
++      dev->vm_bind_queue_id = submit_req.id;
++   }
++
++   ret = tu_drm_get_param(fd, MSM_PARAM_FAULTS, &dev->fault_count);
+    if (ret != 0) {
+       close(fd);
+       return vk_startup_errorf(dev->physical_device->instance,
+@@ -246,15 +285,17 @@
+ 
+ static int
+ msm_submitqueue_new(struct tu_device *dev,
++                    enum tu_queue_type type,
+                     int priority,
+                     uint32_t *queue_id)
+ {
+    assert(priority >= 0 &&
+           priority < dev->physical_device->submitqueue_priority_count);
+    struct drm_msm_submitqueue req = {
+-      .flags = dev->physical_device->info->chip >= 7 &&
+-         dev->physical_device->has_preemption ?
+-         MSM_SUBMITQUEUE_ALLOW_PREEMPT : 0,
++      .flags = type == TU_QUEUE_SPARSE ? MSM_SUBMITQUEUE_VM_BIND :
++            (dev->physical_device->info->chip >= 7 &&
++             dev->physical_device->has_preemption ?
++             MSM_SUBMITQUEUE_ALLOW_PREEMPT : 0),
+       .prio = priority,
+    };
+ 
+@@ -478,34 +519,65 @@
+ }
+ 
+ static VkResult
+-tu_bo_init(struct tu_device *dev,
+-           struct vk_object_base *base,
+-           struct tu_bo *bo,
+-           uint32_t gem_handle,
+-           uint64_t size,
+-           uint64_t client_iova,
+-           enum tu_bo_alloc_flags flags,
+-           const char *name)
++tu_map_vm_bind(struct tu_device *dev, uint32_t map_op_flags, uint64_t iova,
++               uint32_t gem_handle, uint64_t bo_offset, uint64_t range)
++{
++   struct drm_msm_gem_submit_bo_v2 bo = {
++      .flags = map_op_flags,
++      .handle = gem_handle,
++      .address = iova,
++      .bo_offset = bo_offset,
++      .range = range,
++   };
++
++   struct drm_msm_gem_submit req = {
++      .flags = MSM_PIPE_3D0,
++      .nr_bos = 1,
++      .bos = (__u64) &bo,
++      .queueid = dev->vm_bind_queue_id,
++      .bos_stride = sizeof(bo),
++   };
++
++   int ret = drmCommandWriteRead(dev->fd,
++                                 DRM_MSM_GEM_SUBMIT,
++                                 &req, sizeof(req));
++
++   /* When failing to map a BO, the kernel marks the VM as dead */
++   if (ret)
++      return vk_device_set_lost(&dev->vk, "BO map failed: %m");
++
++   /* TODO: batch up and wait only before mmap or submit */
++   return tu_wait_fence(dev, dev->vm_bind_queue_id, req.fence, 1000000000);
++}
++
++static VkResult
++msm_allocate_vm_bind(struct tu_device *dev,
++                     uint32_t gem_handle,
++                     uint64_t size,
++                     uint64_t client_iova,
++                     enum tu_bo_alloc_flags flags,
++                     uint64_t *iova)
+ {
+-   VkResult result = VK_SUCCESS;
+-   uint64_t iova = 0;
++   VkResult result;
+ 
+-   assert(!client_iova || dev->physical_device->has_set_iova);
++   *iova = 0;
+ 
+-   if (dev->physical_device->has_set_iova) {
+-      result = msm_allocate_userspace_iova_locked(dev, gem_handle, size,
+-                                                  client_iova, flags, &iova);
+-   } else {
+-      result = tu_allocate_kernel_iova(dev, gem_handle, &iova);
+-   }
++   result = tu_allocate_userspace_iova(dev, size, client_iova, flags, iova);
+ 
+-   if (result != VK_SUCCESS) {
+-      tu_gem_close(dev, gem_handle);
++   if (result != VK_SUCCESS)
+       return result;
+-   }
+ 
+-   name = tu_debug_bos_add(dev, size, name);
++   uint32_t map_op_flags = MSM_SUBMIT_BO_OP_MAP;
++   if (flags & TU_BO_ALLOC_ALLOW_DUMP)
++      map_op_flags |= MSM_SUBMIT_BO_DUMP;
++   return tu_map_vm_bind(dev, map_op_flags, *iova, gem_handle, 0, size);
++}
+ 
++static VkResult
++tu_bo_add_to_bo_list(struct tu_device *dev,
++                     uint32_t gem_handle, uint32_t flags, uint64_t iova,
++                     uint32_t *bo_list_idx)
++{
+    mtx_lock(&dev->bo_mutex);
+    uint32_t idx = dev->submit_bo_count++;
+ 
+@@ -518,9 +590,6 @@
+       if (!new_ptr) {
+          dev->submit_bo_count--;
+          mtx_unlock(&dev->bo_mutex);
+-         if (dev->physical_device->has_set_iova)
+-            util_vma_heap_free(&dev->vma, iova, size);
+-         tu_gem_close(dev, gem_handle);
+          return VK_ERROR_OUT_OF_HOST_MEMORY;
+       }
+ 
+@@ -533,8 +602,57 @@
+       .flags = MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE |
+                COND(dump, MSM_SUBMIT_BO_DUMP),
+       .handle = gem_handle,
+-      .presumed = iova,
++      .address = iova,
+    };
++
++   mtx_unlock(&dev->bo_mutex);
++   *bo_list_idx = idx;
++   return VK_SUCCESS;
++}
++
++static VkResult
++tu_bo_init(struct tu_device *dev,
++           struct vk_object_base *base,
++           struct tu_bo *bo,
++           uint32_t gem_handle,
++           uint64_t size,
++           uint64_t client_iova,
++           enum tu_bo_alloc_flags flags,
++           const char *name)
++{
++   VkResult result = VK_SUCCESS;
++   uint64_t iova = 0;
++
++   assert(!client_iova || dev->physical_device->has_set_iova);
++
++   if (dev->physical_device->has_sparse) {
++      result = msm_allocate_vm_bind(dev, gem_handle, size, client_iova, flags,
++                                    &iova);
++   } else if (dev->physical_device->has_set_iova) {
++      result = msm_allocate_userspace_iova_locked(dev, gem_handle, size,
++                                                  client_iova, flags, &iova);
++   } else {
++      result = tu_allocate_kernel_iova(dev, gem_handle, &iova);
++   }
++
++   if (result != VK_SUCCESS) {
++      tu_gem_close(dev, gem_handle);
++      return result;
++   }
++
++   name = tu_debug_bos_add(dev, size, name);
++
++   uint32_t idx = 0;
++
++   if (!dev->physical_device->has_sparse) {
++      result = tu_bo_add_to_bo_list(dev, gem_handle, flags, iova, &idx);
++      if (result != VK_SUCCESS) {
++         if (dev->physical_device->has_set_iova)
++            util_vma_heap_free(&dev->vma, iova, size);
++         tu_gem_close(dev, gem_handle);
++         return result;
++      }
++   }
+ 
+    *bo = (struct tu_bo) {
+       .gem_handle = gem_handle,
+@@ -589,14 +707,16 @@
+ static inline void
+ msm_vma_lock(struct tu_device *dev)
+ {
+-   if (dev->physical_device->has_set_iova)
++   if (dev->physical_device->has_set_iova ||
++       dev->physical_device->has_sparse)
+       mtx_lock(&dev->vma_mutex);
+ }
+ 
+ static inline void
+ msm_vma_unlock(struct tu_device *dev)
+ {
+-   if (dev->physical_device->has_set_iova)
++   if (dev->physical_device->has_set_iova ||
++       dev->physical_device->has_sparse)
+       mtx_unlock(&dev->vma_mutex);
+ }
+ 
+@@ -628,6 +748,9 @@
+    if (flags & TU_BO_ALLOC_GPU_READ_ONLY)
+       req.flags |= MSM_BO_GPU_READONLY;
+ 
++   if (dev->physical_device->has_sparse && !(flags & TU_BO_ALLOC_SHAREABLE))
++      req.flags |= MSM_BO_NO_SHARE;
++
+    int ret = drmCommandWriteRead(dev->fd,
+                                  DRM_MSM_GEM_NEW, &req, sizeof(req));
+    if (ret)
+@@ -755,9 +878,14 @@
+ static void
+ msm_bo_allow_dump(struct tu_device *dev, struct tu_bo *bo)
+ {
+-   mtx_lock(&dev->bo_mutex);
+-   dev->submit_bo_list[bo->submit_bo_list_idx].flags |= MSM_SUBMIT_BO_DUMP;
+-   mtx_unlock(&dev->bo_mutex);
++   if (dev->physical_device->has_sparse) {
++      tu_map_vm_bind(dev, MSM_SUBMIT_BO_OP_MAP | MSM_SUBMIT_BO_DUMP,
++                     bo->iova, bo->gem_handle, 0, bo->size);
++   } else {
++      mtx_lock(&dev->bo_mutex);
++      dev->submit_bo_list[bo->submit_bo_list_idx].flags |= MSM_SUBMIT_BO_DUMP;
++      mtx_unlock(&dev->bo_mutex);
++   }
+ }
+ 
+ 
+@@ -799,6 +927,115 @@
+    return ret;
+ }
+ 
++static void
++msm_bo_gem_close(struct tu_device *dev, struct tu_bo *bo)
++{
++   /* Our BO structs are stored in a sparse array in the physical device,
++    * so we don't want to free the BO pointer, instead we want to reset it
++    * to 0, to signal that array entry as being free.
++    */
++   uint32_t gem_handle = bo->gem_handle;
++   memset(bo, 0, sizeof(*bo));
++
++   struct drm_gem_close req = {
++      .handle = gem_handle,
++   };
++
++   drmIoctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &req);
++}
++
++static void
++msm_bo_finish(struct tu_device *dev, struct tu_bo *bo)
++{
++   assert(bo->gem_handle);
++
++   u_rwlock_rdlock(&dev->dma_bo_lock);
++
++   if (!p_atomic_dec_zero(&bo->refcnt)) {
++      u_rwlock_rdunlock(&dev->dma_bo_lock);
++      return;
++   }
++
++   if (bo->map) {
++      TU_RMV(bo_unmap, dev, bo);
++      munmap(bo->map, bo->size);
++   }
++
++   TU_RMV(bo_destroy, dev, bo);
++   tu_debug_bos_del(dev, bo);
++   tu_dump_bo_del(dev, bo);
++
++   if (dev->physical_device->has_sparse) {
++      tu_map_vm_bind(dev, MSM_SUBMIT_BO_OP_UNMAP, bo->iova, bo->gem_handle, 0,
++                     bo->size);
++
++      mtx_lock(&dev->bo_mutex);
++      if (bo->implicit_sync)
++         dev->implicit_sync_bo_count--;
++      mtx_unlock(&dev->bo_mutex);
++
++      mtx_lock(&dev->vma_mutex);
++      util_vma_heap_free(&dev->vma, bo->iova, bo->size);
++      mtx_unlock(&dev->vma_mutex);
++
++      msm_bo_gem_close(dev, bo);
++   } else if (dev->physical_device->has_set_iova) {
++      tu_bo_list_del(dev, bo);
++      tu_bo_make_zombie(dev, bo);
++   } else {
++      tu_bo_list_del(dev, bo);
++
++      msm_bo_gem_close(dev, bo);
++   }
++
++   u_rwlock_rdunlock(&dev->dma_bo_lock);
++}
++
++static VkResult
++msm_sparse_vma_init(struct tu_device *dev,
++                    struct vk_object_base *base,
++                    struct tu_sparse_vma *out_vma,
++                    uint64_t *out_iova,
++                    enum tu_sparse_vma_flags flags,
++                    uint64_t size, uint64_t client_iova)
++{
++   VkResult result;
++   enum tu_bo_alloc_flags bo_flags =
++      (flags & TU_SPARSE_VMA_REPLAYABLE) ? TU_BO_ALLOC_REPLAYABLE :
++      (enum tu_bo_alloc_flags)0;
++
++   out_vma->msm.size = size;
++
++   mtx_lock(&dev->vma_mutex);
++   result = tu_allocate_userspace_iova(dev, size, client_iova, bo_flags,
++                                       &out_vma->msm.iova);
++   mtx_unlock(&dev->vma_mutex);
++
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (flags & TU_SPARSE_VMA_MAP_ZERO) {
++      result = tu_map_vm_bind(dev, MSM_SUBMIT_BO_OP_MAP_NULL, out_vma->msm.iova,
++                              0, 0, size);
++   }
++
++   *out_iova = out_vma->msm.iova;
++
++   return result;
++}
++
++static void
++msm_sparse_vma_finish(struct tu_device *dev,
++                      struct tu_sparse_vma *vma)
++{
++   tu_map_vm_bind(dev, MSM_SUBMIT_BO_OP_UNMAP, vma->msm.iova, 0, 0,
++                  vma->msm.size);
++
++   mtx_lock(&dev->vma_mutex);
++   util_vma_heap_free(&dev->vma, vma->msm.iova, vma->msm.size);
++   mtx_unlock(&dev->vma_mutex);
++}
++
+ static VkResult
+ msm_queue_submit(struct tu_queue *queue, void *_submit,
+                  struct vk_sync_wait *waits, uint32_t wait_count,
+@@ -814,6 +1051,7 @@
+    uint64_t gpu_offset = 0;
+    uint32_t entry_count =
+       util_dynarray_num_elements(&submit->commands, struct drm_msm_gem_submit_cmd);
++   bool has_vm_bind = queue->device->physical_device->has_sparse;
+ #if HAVE_PERFETTO
+    struct tu_perfetto_clocks clocks;
+    uint64_t start_ts = tu_perfetto_begin_submit();
+@@ -869,44 +1107,67 @@
+    if (signal_count)
+       flags |= MSM_SUBMIT_SYNCOBJ_OUT;
+ 
+-   mtx_lock(&queue->device->bo_mutex);
++   if (!has_vm_bind) {
++      mtx_lock(&queue->device->bo_mutex);
+ 
+-   if (queue->device->implicit_sync_bo_count == 0)
+-      flags |= MSM_SUBMIT_NO_IMPLICIT;
++      if (queue->device->implicit_sync_bo_count == 0)
++         flags |= MSM_SUBMIT_NO_IMPLICIT;
+ 
+-   /* drm_msm_gem_submit_cmd requires index of bo which could change at any
+-    * time when bo_mutex is not locked. So we update the index here under the
+-    * lock.
+-    */
+-   util_dynarray_foreach (&submit->commands, struct drm_msm_gem_submit_cmd,
+-                          cmd) {
+-      unsigned i = cmd -
+-         util_dynarray_element(&submit->commands,
+-                               struct drm_msm_gem_submit_cmd, 0);
+-      struct tu_bo **bo = util_dynarray_element(&submit->command_bos,
+-                                                struct tu_bo *, i);
+-      cmd->submit_idx = (*bo)->submit_bo_list_idx;
++      /* drm_msm_gem_submit_cmd requires index of bo which could change at any
++       * time when bo_mutex is not locked. So we update the index here under the
++       * lock.
++       */
++      util_dynarray_foreach (&submit->commands, struct drm_msm_gem_submit_cmd,
++                             cmd) {
++         unsigned i = cmd -
++            util_dynarray_element(&submit->commands,
++                                  struct drm_msm_gem_submit_cmd, 0);
++         struct tu_bo **bo = util_dynarray_element(&submit->command_bos,
++                                                   struct tu_bo *, i);
++         cmd->submit_idx = (*bo)->submit_bo_list_idx;
++      }
+    }
+ 
+-   req = (struct drm_msm_gem_submit) {
+-      .flags = flags,
+-      .nr_bos = entry_count ? queue->device->submit_bo_count : 0,
+-      .nr_cmds = entry_count,
+-      .bos = (uint64_t)(uintptr_t) queue->device->submit_bo_list,
+-      .cmds = (uint64_t)(uintptr_t)submit->commands.data,
+-      .queueid = queue->msm_queue_id,
+-      .in_syncobjs = (uint64_t)(uintptr_t)in_syncobjs,
+-      .out_syncobjs = (uint64_t)(uintptr_t)out_syncobjs,
+-      .nr_in_syncobjs = wait_count,
+-      .nr_out_syncobjs = signal_count,
+-      .syncobj_stride = sizeof(struct drm_msm_gem_submit_syncobj),
+-   };
++   if (submit->binds.size == 0) {
++      req = (struct drm_msm_gem_submit) {
++         .flags = flags,
++         .nr_bos = entry_count ? queue->device->submit_bo_count : 0,
++         .nr_cmds = entry_count,
++         .bos = (uint64_t)(uintptr_t) queue->device->submit_bo_list,
++         .cmds = (uint64_t)(uintptr_t)submit->commands.data,
++         .queueid = queue->msm_queue_id,
++         .in_syncobjs = (uint64_t)(uintptr_t)in_syncobjs,
++         .out_syncobjs = (uint64_t)(uintptr_t)out_syncobjs,
++         .nr_in_syncobjs = wait_count,
++         .nr_out_syncobjs = signal_count,
++         .syncobj_stride = sizeof(struct drm_msm_gem_submit_syncobj),
++      };
++   } else {
++      uint32_t bind_count =
++         util_dynarray_num_elements(&submit->binds,
++                                    struct drm_msm_gem_submit_bo_v2);
++      req = (struct drm_msm_gem_submit) {
++         .flags = flags,
++         .nr_bos = bind_count,
++         .nr_cmds = 0,
++         .bos = (uint64_t)(uintptr_t)submit->binds.data,
++         .cmds = 0,
++         .queueid = queue->msm_queue_id,
++         .in_syncobjs = (uint64_t)(uintptr_t)in_syncobjs,
++         .out_syncobjs = (uint64_t)(uintptr_t)out_syncobjs,
++         .nr_in_syncobjs = wait_count,
++         .nr_out_syncobjs = signal_count,
++         .syncobj_stride = sizeof(struct drm_msm_gem_submit_syncobj),
++         .bos_stride = sizeof(struct drm_msm_gem_submit_bo_v2),
++      };
++   }
+ 
+    ret = drmCommandWriteRead(queue->device->fd,
+                              DRM_MSM_GEM_SUBMIT,
+                              &req, sizeof(req));
+ 
+-   mtx_unlock(&queue->device->bo_mutex);
++   if (!has_vm_bind)
++      mtx_unlock(&queue->device->bo_mutex);
+ 
+    if (ret) {
+       result = vk_device_set_lost(&queue->device->vk, "submit failed: %m");
+@@ -977,14 +1238,17 @@
+       .bo_export_dmabuf = tu_drm_export_dmabuf,
+       .bo_map = msm_bo_map,
+       .bo_allow_dump = msm_bo_allow_dump,
+-      .bo_finish = tu_drm_bo_finish,
++      .bo_finish = msm_bo_finish,
+       .bo_set_metadata = msm_bo_set_metadata,
+       .bo_get_metadata = msm_bo_get_metadata,
+       .submit_create = msm_submit_create,
+       .submit_finish = msm_submit_finish,
+       .submit_add_entries = msm_submit_add_entries,
++      .submit_add_bind = msm_submit_add_bind,
+       .queue_submit = msm_queue_submit,
+       .queue_wait_fence = msm_queue_wait_fence,
++      .sparse_vma_init = msm_sparse_vma_init,
++      .sparse_vma_finish = msm_sparse_vma_finish,
+ };
+ 
+ VkResult
+@@ -1023,6 +1287,8 @@
+    device->instance = instance;
+    device->local_fd = fd;
+ 
++   device->has_sparse = tu_try_enable_vm_bind(fd) == 0;
++
+    if (tu_drm_get_gpu_id(device, &device->dev_id.gpu_id)) {
+       result = vk_startup_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                                  "could not get GPU ID");
+Index: src/freedreno/ir3/ir3_nir.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+--- a/src/freedreno/ir3/ir3_nir.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/ir3/ir3_nir.c	(date 1738998728563)
+@@ -13,6 +13,8 @@
+ #include "ir3_nir.h"
+ #include "ir3_shader.h"
+ 
++#include "nir_builtin_builder.h"
++
+ /* For use by binning_pass shaders, where const_state is const, but expected
+  * to be already set up when we compiled the corresponding non-binning variant
+  */
+@@ -548,6 +550,79 @@
+       shader, ir3_nir_lower_array_sampler_cb,
+       nir_metadata_control_flow, NULL);
+ }
++
++static bool
++ir3_nir_lower_sparse_residency_cb(nir_builder *b, nir_intrinsic_instr *instr,
++                                  void *data)
++{
++   b->cursor = nir_before_instr(&instr->instr);
++
++   nir_def *def;
++   switch (instr->intrinsic) {
++   case nir_intrinsic_is_sparse_texels_resident:
++      def = nir_ieq_imm(b, instr->src[0].ssa, 0);
++      break;
++   case nir_intrinsic_sparse_residency_code_and:
++      def = nir_ior(b, instr->src[0].ssa, instr->src[1].ssa);
++      break;
++   default:
++      return false;
++   }
++
++   nir_def_rewrite_uses(&instr->def, def);
++   return true;
++}
++
++static bool
++ir3_nir_lower_sparse_residency(nir_shader *shader)
++{
++   return nir_shader_intrinsics_pass(
++      shader, ir3_nir_lower_sparse_residency_cb,
++      nir_metadata_control_flow, NULL);
++}
++
++/* The hardware implementiation of min LOD clamp is broken when the given LOD
++ * clamp value (min_lod) is greater than levelCount - 1 (that is, when it would
++ * be clamped by the hardware to avoid accessing an out-of-bounds level).
++ * Instead of clamping the clamped LOD afterwards, it just returns zero. Because
++ * the LOD would always be clamped to levelCount - 1 in this case, we can just
++ * clamp min_lod to levelCount - 1 and get the same result while avoiding the
++ * hardware bug.
++ */
++static bool
++ir3_nir_min_lod_workaround_cb(struct nir_builder *b, nir_instr *instr, void *_data)
++{
++   if (instr->type != nir_instr_type_tex)
++      return false;
++
++   nir_tex_instr *tex = nir_instr_as_tex(instr);
++
++   int src_idx = nir_tex_instr_src_index(tex, nir_tex_src_min_lod);
++   if (src_idx < 0)
++      return false;
++
++   b->cursor = nir_before_instr(&tex->instr);
++
++   nir_def *level_count = nir_build_texture_query(b, tex,
++                                                  nir_texop_query_levels, 1,
++                                                  nir_type_uint32,
++                                                  false, false);
++
++   nir_def *src = tex->src[src_idx].src.ssa;
++   src = nir_fmin(b, src, nir_i2fN(b, nir_iadd_imm(b, level_count, -1),
++                                   src->bit_size));
++   nir_src_rewrite(&tex->src[src_idx].src, src);
++
++   return true;
++}
++
++static bool
++ir3_nir_min_lod_workaround(nir_shader *shader)
++{
++   return nir_shader_instructions_pass(
++      shader, ir3_nir_min_lod_workaround_cb,
++      nir_metadata_control_flow, NULL);
++}
+ 
+ void
+ ir3_finalize_nir(struct ir3_compiler *compiler,
+@@ -588,6 +663,9 @@
+    OPT_V(s, nir_lower_tex, &tex_options);
+    OPT_V(s, nir_lower_load_const_to_scalar);
+ 
++   NIR_PASS_V(s, ir3_nir_lower_sparse_residency);
++   NIR_PASS_V(s, ir3_nir_min_lod_workaround);
++
+    if (compiler->array_index_add_half)
+       OPT_V(s, ir3_nir_lower_array_sampler);
+ 
+Index: src/freedreno/fdl/freedreno_layout.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/fdl/freedreno_layout.h b/src/freedreno/fdl/freedreno_layout.h
+--- a/src/freedreno/fdl/freedreno_layout.h	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/fdl/freedreno_layout.h	(date 1738998728491)
+@@ -125,6 +125,7 @@
+    uint32_t width0, height0, depth0;
+    uint32_t mip_levels;
+    uint32_t nr_samples;
++   uint32_t mip_tail_first_lod; /* for sparse resources */
+    enum pipe_format format;
+ 
+    uint64_t size;       /* Size of the whole image, in bytes. */
+@@ -213,6 +214,30 @@
+    return false;
+ }
+ 
++static inline uint32_t
++fdl_sparse_miptail_offset(const struct fdl_layout *layout)
++{
++   assert(layout->layer_first);
++
++   if (layout->mip_tail_first_lod == layout->mip_levels)
++      return layout->layer_size + layout->slices[0].offset;
++   else
++      return layout->slices[layout->mip_tail_first_lod].offset;
++}
++
++static inline uint32_t
++fdl_sparse_miptail_size(const struct fdl_layout *layout)
++{
++   assert(layout->layer_first);
++
++   if (layout->mip_tail_first_lod == layout->mip_levels)
++      return 0;
++   else
++      return layout->layer_size -
++         (layout->slices[layout->mip_tail_first_lod].offset -
++         layout->slices[0].offset);
++}
++
+ static inline uint32_t
+ fdl_tile_mode(const struct fdl_layout *layout, int level)
+ {
+@@ -240,7 +265,7 @@
+ bool fdl6_layout(struct fdl_layout *layout, const struct fd_dev_info *info,
+                  enum pipe_format format, uint32_t nr_samples, uint32_t width0,
+                  uint32_t height0, uint32_t depth0, uint32_t mip_levels,
+-                 uint32_t array_size, bool is_3d, bool is_mutable,
++                 uint32_t array_size, bool is_3d, bool is_mutable, bool sparse,
+                  struct fdl_explicit_layout *plane_layout);
+ 
+ static inline void
+@@ -253,9 +278,26 @@
+ 
+ void fdl_dump_layout(struct fdl_layout *layout);
+ 
++void fdl_get_sparse_block_size(enum pipe_format format, uint32_t nr_samples,
++                               uint32_t *blockwidth, uint32_t *blockheight);
++
+ void fdl6_get_ubwc_blockwidth(const struct fdl_layout *layout,
+                               uint32_t *blockwidth, uint32_t *blockheight);
+ 
++void fdl6_get_ubwc_macrotile_size(const struct fdl_layout *layout,
++                                  uint32_t *macrotile_width,
++                                  uint32_t *macrotile_height);
++
++/* Single-sampled R8G8 textures have a special UBWC block layout. */
++static inline bool
++fdl6_is_r8g8(const struct fdl_layout *layout)
++{
++   return layout->cpp == 2 &&
++          util_format_get_nr_components(layout->format) == 2 &&
++          !layout->is_mutable;
++}
++
++
+ enum fdl_view_type {
+    FDL_VIEW_TYPE_1D = 0,
+    FDL_VIEW_TYPE_2D = 1,
+@@ -373,6 +415,11 @@
+                             uint32_t dst_pitch,
+                             const struct fdl_ubwc_config *config);
+ 
++uint32_t fdl6_get_bank_mask(const struct fdl_layout *layout, unsigned miplevel,
++                            const struct fdl_ubwc_config *config);
++
++uint32_t fdl6_get_bank_shift(const struct fdl_ubwc_config *config);
++
+ ENDC;
+ 
+ #endif /* FREEDRENO_LAYOUT_H_ */
+Index: src/freedreno/vulkan/tu_device.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+--- a/src/freedreno/vulkan/tu_device.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_device.cc	(date 1738998728687)
+@@ -390,7 +390,15 @@
+    features->shaderFloat64 = false;
+    features->shaderInt64 = true;
+    features->shaderInt16 = true;
+-   features->sparseBinding = false;
++   features->sparseBinding = pdevice->has_sparse;
++   features->sparseResidencyBuffer = pdevice->has_sparse;
++   features->sparseResidencyImage2D = pdevice->has_sparse &&
++      pdevice->info->a7xx.ubwc_all_formats_compatible;
++   features->sparseResidency2Samples = features->sparseResidencyImage2D;
++   features->sparseResidency4Samples = features->sparseResidencyImage2D;
++   features->sparseResidencyAliased = pdevice->has_sparse;
++   features->shaderResourceResidency = pdevice->has_sparse;
++   features->shaderResourceMinLod = true;
+    features->variableMultisampleRate = true;
+    features->inheritedQueries = true;
+ 
+@@ -963,7 +971,7 @@
+    props->maxMemoryAllocationCount = UINT32_MAX;
+    props->maxSamplerAllocationCount = 64 * 1024;
+    props->bufferImageGranularity = 64;          /* A cache line */
+-   props->sparseAddressSpaceSize = 0;
++   props->sparseAddressSpaceSize = pdevice->va_size;
+    props->maxBoundDescriptorSets = pdevice->usable_sets;
+    props->maxPerStageDescriptorSamplers = max_descriptor_set_size;
+    props->maxPerStageDescriptorUniformBuffers = max_descriptor_set_size;
+@@ -1085,11 +1093,11 @@
+    props->dynamicRenderingLocalReadMultisampledAttachments = true;
+ 
+    /* sparse properties */
+-   props->sparseResidencyStandard2DBlockShape = { 0 };
+-   props->sparseResidencyStandard2DMultisampleBlockShape = { 0 };
+-   props->sparseResidencyStandard3DBlockShape = { 0 };
+-   props->sparseResidencyAlignedMipSize = { 0 };
+-   props->sparseResidencyNonResidentStrict = { 0 };
++   props->sparseResidencyStandard2DBlockShape = true;
++   props->sparseResidencyStandard2DMultisampleBlockShape = true;
++   props->sparseResidencyStandard3DBlockShape = false;
++   props->sparseResidencyAlignedMipSize = false;
++   props->sparseResidencyNonResidentStrict = true;
+ 
+    strcpy(props->deviceName, pdevice->name);
+    memcpy(props->pipelineCacheUUID, pdevice->cache_uuid, VK_UUID_SIZE);
+@@ -1362,6 +1370,21 @@
+    NULL,
+ };
+ 
++static const VkQueueFamilyProperties tu_gfx_queue_family_properties = {
++   .queueFlags =
++      VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
++   .queueCount = 1,
++   .timestampValidBits = 48,
++   .minImageTransferGranularity = { 1, 1, 1 },
++};
++
++static const VkQueueFamilyProperties tu_sparse_queue_family_properties = {
++   .queueFlags = VK_QUEUE_SPARSE_BINDING_BIT,
++   .queueCount = 1,
++   .timestampValidBits = 48,
++   .minImageTransferGranularity = { 1, 1, 1 },
++};
++
+ VkResult
+ tu_physical_device_init(struct tu_physical_device *device,
+                         struct tu_instance *instance)
+@@ -1522,6 +1545,20 @@
+ 
+    device->vk.supported_sync_types = device->sync_types;
+ 
++   device->queue_families[device->num_queue_families++] =
++      (struct tu_queue_family) {
++         .type = TU_QUEUE_GFX,
++         .properties = &tu_gfx_queue_family_properties,
++      };
++
++   if (device->has_sparse) {
++      device->queue_families[device->num_queue_families++] =
++         (struct tu_queue_family) {
++            .type = TU_QUEUE_SPARSE,
++            .properties = &tu_sparse_queue_family_properties,
++         };
++   }
++
+ #ifdef TU_USE_WSI_PLATFORM
+    result = tu_wsi_init(device);
+    if (result != VK_SUCCESS) {
+@@ -1699,18 +1736,18 @@
+    vk_free(&instance->vk.alloc, instance);
+ }
+ 
+-static const VkQueueFamilyProperties tu_queue_family_properties = {
+-   .queueFlags =
+-      VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+-   .queueCount = 1,
+-   .timestampValidBits = 48,
+-   .minImageTransferGranularity = { 1, 1, 1 },
+-};
+-
+ void
+ tu_physical_device_get_global_priority_properties(const struct tu_physical_device *pdevice,
++                                                  enum tu_queue_type type,
+                                                   VkQueueFamilyGlobalPriorityPropertiesKHR *props)
+ {
++   /* drm/msm only supports one priority for VM_BIND queues */
++   if (type == TU_QUEUE_SPARSE) {
++      props->priorityCount = 1;
++      props->priorities[0] = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
++      return;
++   }
++
+    props->priorityCount = MIN2(pdevice->submitqueue_priority_count, 3);
+    switch (props->priorityCount) {
+    case 1:
+@@ -1742,20 +1779,25 @@
+    VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2, out,
+                           pQueueFamilyProperties, pQueueFamilyPropertyCount);
+ 
+-   vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p)
+-   {
+-      p->queueFamilyProperties = tu_queue_family_properties;
++   for (unsigned i = 0; i < pdevice->num_queue_families; i++) {
++      struct tu_queue_family *family = &pdevice->queue_families[i];
++
++      vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p)
++      {
++         p->queueFamilyProperties = *family->properties;
+ 
+-      vk_foreach_struct(ext, p->pNext) {
+-         switch (ext->sType) {
+-         case VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR: {
+-            VkQueueFamilyGlobalPriorityPropertiesKHR *props =
+-               (VkQueueFamilyGlobalPriorityPropertiesKHR *) ext;
+-            tu_physical_device_get_global_priority_properties(pdevice, props);
+-            break;
+-         }
+-         default:
+-            break;
++         vk_foreach_struct(ext, p->pNext) {
++            switch (ext->sType) {
++            case VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR: {
++               VkQueueFamilyGlobalPriorityPropertiesKHR *props =
++                  (VkQueueFamilyGlobalPriorityPropertiesKHR *) ext;
++               tu_physical_device_get_global_priority_properties(
++                  pdevice, family->type, props);
++               break;
++            }
++            default:
++               break;
++            }
+          }
+       }
+    }
+@@ -2501,6 +2543,7 @@
+       const VkDeviceQueueCreateInfo *queue_create =
+          &pCreateInfo->pQueueCreateInfos[i];
+       uint32_t qfi = queue_create->queueFamilyIndex;
++      enum tu_queue_type type = physical_device->queue_families[qfi].type;
+       device->queues[qfi] = (struct tu_queue *) vk_alloc(
+          &device->vk.alloc,
+          queue_create->queueCount * sizeof(struct tu_queue), 8,
+@@ -2518,7 +2561,8 @@
+       device->queue_count[qfi] = queue_create->queueCount;
+ 
+       for (unsigned q = 0; q < queue_create->queueCount; q++) {
+-         result = tu_queue_init(device, &device->queues[qfi][q], q, queue_create);
++         result = tu_queue_init(device, &device->queues[qfi][q], type, q,
++                                queue_create);
+          if (result != VK_SUCCESS) {
+             device->queue_count[qfi] = q;
+             goto fail_queues;
+@@ -2557,8 +2601,7 @@
+    /* Initialize sparse array for refcounting imported BOs */
+    util_sparse_array_init(&device->bo_map, sizeof(struct tu_bo), 512);
+ 
+-   if (physical_device->has_set_iova) {
+-      STATIC_ASSERT(TU_MAX_QUEUE_FAMILIES == 1);
++   if (physical_device->has_set_iova && !physical_device->has_sparse) {
+       if (!u_vector_init(&device->zombie_vmas, 64,
+                          sizeof(struct tu_zombie_vma))) {
+          result = vk_startup_errorf(physical_device->instance,
+Index: src/freedreno/vulkan/tu_knl.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
+--- a/src/freedreno/vulkan/tu_knl.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_knl.cc	(date 1738998728729)
+@@ -39,6 +39,8 @@
+ {
+    struct tu_instance *instance = dev->physical_device->instance;
+ 
++   size = ALIGN(size, os_page_size);
++
+    VkResult result =
+       dev->instance->knl->bo_init(dev, base, out_bo, size, client_iova,
+                                   mem_property, flags, name);
+@@ -64,6 +66,7 @@
+                   uint64_t size,
+                   int fd)
+ {
++   size = ALIGN(size, os_page_size);
+    VkResult result = dev->instance->knl->bo_init_dmabuf(dev, bo, size, fd);
+    if (result != VK_SUCCESS)
+       return result;
+@@ -223,6 +226,29 @@
+    dev->instance->knl->bo_set_metadata(dev, bo, metadata, metadata_size);
+ }
+ 
++VkResult
++tu_sparse_vma_init(struct tu_device *dev,
++                   struct vk_object_base *base,
++                   struct tu_sparse_vma *out_vma,
++                   uint64_t *out_iova,
++                   enum tu_sparse_vma_flags flags,
++                   uint64_t size, uint64_t client_iova)
++{
++   size = ALIGN(size, os_page_size);
++
++   out_vma->flags = flags;
++   return dev->instance->knl->sparse_vma_init(dev, base, out_vma, out_iova,
++                                              flags, size, client_iova);
++
++}
++
++void
++tu_sparse_vma_finish(struct tu_device *dev,
++                     struct tu_sparse_vma *vma)
++{
++   dev->instance->knl->sparse_vma_finish(dev, vma);
++}
++
+ int
+ tu_bo_get_metadata(struct tu_device *dev, struct tu_bo *bo,
+                    void *metadata, uint32_t metadata_size)
+@@ -275,10 +301,11 @@
+ 
+ int
+ tu_drm_submitqueue_new(struct tu_device *dev,
++                       enum tu_queue_type type,
+                        int priority,
+                        uint32_t *queue_id)
+ {
+-   return dev->instance->knl->submitqueue_new(dev, priority, queue_id);
++   return dev->instance->knl->submitqueue_new(dev, type, priority, queue_id);
+ }
+ 
+ void
+@@ -308,6 +335,19 @@
+                                                  num_entries);
+ }
+ 
++void
++tu_submit_add_bind(struct tu_device *dev,
++                   void *_submit,
++                   struct tu_sparse_vma *vma, uint64_t vma_offset,
++                   struct tu_bo *bo, uint64_t bo_offset,
++                   uint64_t size)
++{
++   assert(vma_offset % 4096 == 0);
++   assert(bo_offset % 4096 == 0);
++   return dev->instance->knl->submit_add_bind(dev, _submit, vma, vma_offset,
++                                              bo, bo_offset, size);
++}
++
+ VkResult
+ tu_queue_submit(struct tu_queue *queue, void *submit,
+                 struct vk_sync_wait *waits, uint32_t wait_count,
+Index: src/freedreno/vulkan/tu_device.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+--- a/src/freedreno/vulkan/tu_device.h	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_device.h	(date 1738998728695)
+@@ -19,6 +19,7 @@
+ #include "tu_cs.h"
+ #include "tu_pass.h"
+ #include "tu_perfetto.h"
++#include "tu_queue.h"
+ #include "tu_suballoc.h"
+ #include "tu_util.h"
+ 
+@@ -31,7 +32,7 @@
+ /* queue types */
+ #define TU_QUEUE_GENERAL 0
+ 
+-#define TU_MAX_QUEUE_FAMILIES 1
++#define TU_MAX_QUEUE_FAMILIES 2
+ 
+ #define TU_BORDER_COLOR_COUNT 4096
+ #define TU_BORDER_COLOR_BUILTIN 6
+@@ -74,6 +75,11 @@
+    TU_KGSL_DMA_TYPE_DMAHEAP,
+ };
+ 
++struct tu_queue_family {
++   enum tu_queue_type type;
++   const VkQueueFamilyProperties *properties;
++};
++
+ extern uint64_t os_page_size;
+ 
+ struct tu_physical_device
+@@ -121,6 +127,7 @@
+ 
+    bool has_set_iova;
+    bool has_raytracing;
++   bool has_sparse;
+    uint64_t va_start;
+    uint64_t va_size;
+ 
+@@ -137,6 +144,9 @@
+       VkMemoryPropertyFlags types[VK_MAX_MEMORY_TYPES];
+    } memory;
+ 
++   struct tu_queue_family queue_families[TU_MAX_QUEUE_FAMILIES];
++   unsigned num_queue_families;
++
+    struct fd_dev_id dev_id;
+    struct fd_dev_info dev_info;
+    const struct fd_dev_info *info;
+@@ -437,6 +447,9 @@
+    bool use_lrz;
+ 
+    struct fd_rd_output rd_output;
++
++   /* This is an internal queue for mapping/unmapping non-sparse BOs */
++   uint32_t vm_bind_queue_id;
+ };
+ VK_DEFINE_HANDLE_CASTS(tu_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+ 
+@@ -507,6 +520,7 @@
+ 
+ void
+ tu_physical_device_get_global_priority_properties(const struct tu_physical_device *pdevice,
++                                                  enum tu_queue_type type,
+                                                   VkQueueFamilyGlobalPriorityPropertiesKHR *props);
+ 
+ uint64_t
+Index: src/freedreno/fdl/fd_layout_test.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/fdl/fd_layout_test.c b/src/freedreno/fdl/fd_layout_test.c
+--- a/src/freedreno/fdl/fd_layout_test.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/fdl/fd_layout_test.c	(date 1738998728479)
+@@ -34,7 +34,8 @@
+                   MAX2(testcase->layout.nr_samples, 1), testcase->layout.width0,
+                   MAX2(testcase->layout.height0, 1),
+                   MAX2(testcase->layout.depth0, 1), mip_levels,
+-                  MAX2(testcase->array_size, 1), testcase->is_3d, false, NULL);
++                  MAX2(testcase->array_size, 1), testcase->is_3d, false, false,
++                  NULL);
+    } else {
+       assert(fd_dev_gen(dev_id) >= 5);
+       fdl5_layout(&layout, testcase->format,
+Index: src/freedreno/vulkan/tu_buffer.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_buffer.cc b/src/freedreno/vulkan/tu_buffer.cc
+--- a/src/freedreno/vulkan/tu_buffer.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_buffer.cc	(date 1738998728615)
+@@ -28,6 +28,39 @@
+    if (buffer == NULL)
+       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
++   if (pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
++      struct tu_instance *instance = device->physical_device->instance;
++      BITMASK_ENUM(tu_sparse_vma_flags) flags = 0;
++      uint64_t client_address = 0;
++
++      if (pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT)
++         flags |= TU_SPARSE_VMA_MAP_ZERO;
++      if (pCreateInfo->flags & VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT)
++         flags |= TU_SPARSE_VMA_REPLAYABLE;
++
++      const VkBufferOpaqueCaptureAddressCreateInfo *replay_info =
++         vk_find_struct_const(pCreateInfo->pNext,
++                              BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO);
++      if (replay_info && replay_info->opaqueCaptureAddress) {
++         client_address = replay_info->opaqueCaptureAddress;
++         flags |= TU_SPARSE_VMA_REPLAYABLE;
++      }
++
++      VkResult result =
++         tu_sparse_vma_init(device, &buffer->vk.base, &buffer->vma,
++                            &buffer->iova, flags, pCreateInfo->size,
++                            client_address);
++
++      if (result != VK_SUCCESS) {
++         vk_buffer_destroy(&device->vk, pAllocator, &buffer->vk);
++         return result;
++      }
++
++      vk_address_binding_report(&instance->vk, &buffer->vk.base,
++                                buffer->iova, buffer->vk.size,
++                                VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
++   }
++
+    TU_RMV(buffer_create, device, buffer);
+ 
+ #ifdef HAVE_PERFETTO
+@@ -57,10 +90,16 @@
+    tu_perfetto_log_destroy_buffer(device, buffer);
+ #endif
+ 
+-   if (buffer->iova)
++   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
++      vk_address_binding_report(&instance->vk, &buffer->vk.base,
++                                buffer->iova, buffer->vk.size,
++                                VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
++      tu_sparse_vma_finish(device, &buffer->vma);
++   } else if (buffer->iova) {
+       vk_address_binding_report(&instance->vk, &buffer->vk.base,
+                                 buffer->iova, buffer->bo_size,
+                                 VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
++   }
+ 
+ 
+    vk_buffer_destroy(&device->vk, pAllocator, &buffer->vk);
+@@ -75,9 +114,12 @@
+    VK_FROM_HANDLE(tu_device, device, _device);
+ 
+    uint64_t size = pInfo->pCreateInfo->size;
++   uint32_t alignment =
++      (pInfo->pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) ?
++      os_page_size : 64;
+    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
+-      .size = MAX2(align64(size, 64), size),
+-      .alignment = 64,
++      .size = MAX2(align64(size, alignment), size),
++      .alignment = alignment,
+       .memoryTypeBits = (1 << device->physical_device->memory.type_count) - 1,
+    };
+ 
+Index: src/freedreno/vulkan/tu_shader.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+--- a/src/freedreno/vulkan/tu_shader.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_shader.cc	(date 1738998834670)
+@@ -511,6 +511,7 @@
+       return lower_ssbo_ubo_intrinsic(dev, b, instr);
+ 
+    case nir_intrinsic_image_deref_load:
++   case nir_intrinsic_image_deref_sparse_load:
+    case nir_intrinsic_image_deref_store:
+    case nir_intrinsic_image_deref_atomic:
+    case nir_intrinsic_image_deref_atomic_swap:
+Index: src/freedreno/ir3/ir3_nir_lower_tex_prefetch.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/ir3/ir3_nir_lower_tex_prefetch.c b/src/freedreno/ir3/ir3_nir_lower_tex_prefetch.c
+--- a/src/freedreno/ir3/ir3_nir_lower_tex_prefetch.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/ir3/ir3_nir_lower_tex_prefetch.c	(date 1738998728569)
+@@ -158,7 +158,8 @@
+          continue;
+ 
+       /* only prefetch for simple 2d tex fetch case */
+-      if (tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array)
++      if (tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array ||
++          tex->is_sparse)
+          continue;
+ 
+       if (!ok_tex_samp(tex))
+Index: src/freedreno/fdl/fd6_layout.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/fdl/fd6_layout.c b/src/freedreno/fdl/fd6_layout.c
+--- a/src/freedreno/fdl/fd6_layout.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/fdl/fd6_layout.c	(date 1738998728462)
+@@ -15,14 +15,6 @@
+ #include "adreno_common.xml.h"
+ #include "a6xx.xml.h"
+ 
+-static bool
+-is_r8g8(const struct fdl_layout *layout)
+-{
+-   return layout->cpp == 2 &&
+-          util_format_get_nr_components(layout->format) == 2 &&
+-          !layout->is_mutable;
+-}
+-
+ void
+ fdl6_get_ubwc_blockwidth(const struct fdl_layout *layout,
+                          uint32_t *blockwidth, uint32_t *blockheight)
+@@ -45,7 +37,7 @@
+    };
+ 
+    /* special case for r8g8: */
+-   if (is_r8g8(layout)) {
++   if (fdl6_is_r8g8(layout)) {
+       *blockwidth = 16;
+       *blockheight = 8;
+       return;
+@@ -88,7 +80,7 @@
+    layout->pitchalign = fdl_cpp_shift(layout);
+    *heightalign = 16;
+ 
+-   if (is_r8g8(layout) || layout->cpp == 1) {
++   if (fdl6_is_r8g8(layout) || layout->cpp == 1) {
+       layout->pitchalign = 1;
+       *heightalign = 32;
+    } else if (layout->cpp == 2) {
+@@ -100,7 +92,7 @@
+     * heavily undertested and the "officially" supported alignment is 4096b.
+     */
+    if (layout->ubwc || util_format_is_depth_or_stencil(layout->format) ||
+-       is_r8g8(layout))
++       fdl6_is_r8g8(layout))
+       layout->base_align = 4096;
+    else if (layout->cpp == 1)
+       layout->base_align = 64;
+@@ -117,11 +109,12 @@
+ fdl6_layout(struct fdl_layout *layout, const struct fd_dev_info *info,
+             enum pipe_format format, uint32_t nr_samples, uint32_t width0,
+             uint32_t height0, uint32_t depth0, uint32_t mip_levels,
+-            uint32_t array_size, bool is_3d, bool is_mutable,
++            uint32_t array_size, bool is_3d, bool is_mutable, bool sparse,
+             struct fdl_explicit_layout *explicit_layout)
+ {
+    uint32_t offset = 0, heightalign;
+    uint32_t ubwc_blockwidth, ubwc_blockheight;
++   uint32_t sparse_blockwidth, sparse_blockheight;
+ 
+    assert(nr_samples > 0);
+    layout->width0 = width0;
+@@ -139,6 +132,10 @@
+    layout->is_mutable = is_mutable;
+ 
+    fdl6_get_ubwc_blockwidth(layout, &ubwc_blockwidth, &ubwc_blockheight);
++   fdl_get_sparse_block_size(format, nr_samples, &sparse_blockwidth,
++                             &sparse_blockheight);
++   uint32_t sparse_blocksize = 65536;
++   assert(sparse_blocksize == sparse_blockwidth * sparse_blockheight * layout->cpp);
+ 
+    /* For simplicity support UBWC only for 3D images without mipmaps,
+     * most d3d11 games don't use mipmaps for 3D images.
+@@ -223,6 +220,7 @@
+                         ubwc_tile_height_alignment);
+ 
+    uint32_t min_3d_layer_size = 0;
++   bool in_sparse_miptail = false;
+ 
+    for (uint32_t level = 0; level < mip_levels; level++) {
+       uint32_t depth = u_minify(depth0, level);
+@@ -230,8 +228,21 @@
+       struct fdl_slice *ubwc_slice = &layout->ubwc_slices[level];
+       enum a6xx_tile_mode tile_mode = fdl_tile_mode(layout, level);
+       uint32_t pitch = fdl_pitch(layout, level);
++      uint32_t width = u_minify(width0, level);
+       uint32_t height = u_minify(height0, level);
+ 
++      /* Follow the Vulkan requirements for when the miptail begins. */
++      if (sparse &&
++          (width < sparse_blockwidth || height < sparse_blockheight) &&
++          !in_sparse_miptail) {
++         in_sparse_miptail = true;
++         layout->mip_tail_first_lod = level;
++         /* The algorithm here follows the HW, which should ensure that the
++          * miptail is page aligned. If not we're in big trouble.
++          */
++         assert(layout->size % 4096 == 0);
++      }
++
+       uint32_t nblocksy = util_format_get_nblocksy(format, height);
+       if (tile_mode)
+          nblocksy = align(nblocksy, heightalign);
+@@ -300,6 +311,38 @@
+ 
+    if (layout->layer_first) {
+       layout->layer_size = align64(layout->size, 4096);
++
++      if (sparse) {
++         if (!in_sparse_miptail) {
++            layout->mip_tail_first_lod = layout->mip_levels;
++            assert(layout->layer_size % 4096 == 0);
++         }
++
++         /* Honor the Vulkan requirement that the mip tail region is a
++          * multiple of the sparse block size (i.e. 64k). Note that the mip
++          * tail offset is *not* required to be a multiple of the sparse
++          * block size, and we can't guarantee that anyway as the miplevel
++          * offset is controlled by the HW. The partial block before the
++          * miptail will only be partially mapped.
++          */
++         uint32_t mip_tail_size = fdl_sparse_miptail_size(layout);
++
++         /* Vulkan CTS requires that as the image size decreases, the
++          * memory requirements always decrease or stay the same. If there
++          * is no sparse miptail, apply the same padding to the last layer
++          * so that if the image becomes small enough to have a sparse
++          * miptail then the padding still applies.
++          */
++         if (mip_tail_size == 0) {
++            mip_tail_size = layout->slices[mip_levels - 1].size0;
++         }
++
++         assert(mip_tail_size % 4096 == 0);
++
++         layout->layer_size +=
++            (sparse_blocksize - mip_tail_size) % sparse_blocksize;
++      }
++
+       layout->size = layout->layer_size * array_size;
+    }
+ 
+Index: src/freedreno/isa/ir3-cat5.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/isa/ir3-cat5.xml b/src/freedreno/isa/ir3-cat5.xml
+--- a/src/freedreno/isa/ir3-cat5.xml	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/isa/ir3-cat5.xml	(date 1738998728598)
+@@ -56,7 +56,7 @@
+ 		The "normal" case, ie. not s2en (indirect) and/or bindless
+ 	</doc>
+ 	<display>
+-		{SY}{JP}{NAME}{3D}{A}{O}{P}{SV}{1D} {TYPE}({WRMASK}){DST_HALF}{DST}{SRC1}{SRC2}{SAMP}{TEX}
++		{SY}{JP}{NAME}{3D}{A}{O}{P}{SV}{1D}{CLP}{RCK} {TYPE}({WRMASK}){DST_HALF}{DST}{SRC1}{SRC2}{SAMP}{TEX}
+ 	</display>
+ 	<derived name="DST_HALF" expr="#type-half" type="bool" display="h"/>
+ 	<field name="FULL" pos="0" type="bool"/>
+@@ -69,6 +69,7 @@
+ 		<param name="NUM_SRC"/>
+ 		<param name="HALF"/>
+ 		<param name="O"/>
++		<param name="CLP"/>
+ 		<param name="SRC2_IMM_OFFSET"/>
+ 	</field>
+ 	<!--
+@@ -126,6 +127,7 @@
+ 	<derived name="SRC2_IMM_OFFSET" expr="#false" type="bool"/>
+ 	<derived name="P" expr="#false" type="bool" display=""/>
+ 	<derived name="1D" expr="#false" type="bool" display=""/>
++	<derived name="RCK" expr="#cat5-is-rck" type="bool" display=".rck"/>
+ </bitset>
+ 
+ <bitset name="#instruction-cat5-tex-base" extends="#instruction-cat5">
+@@ -135,7 +137,7 @@
+ 			The s2en (indirect) or bindless case
+ 		</doc>
+ 		<display>
+-			{SY}{JP}{NAME}{3D}{A}{O}{P}{SV}{S2EN}{UNIFORM}{NONUNIFORM}{BASE}{1D} {TYPE}({WRMASK}){DST_HALF}{DST}{SRC1}{SRC2}{SRC3}{A1}
++			{SY}{JP}{NAME}{3D}{A}{O}{P}{SV}{S2EN}{UNIFORM}{NONUNIFORM}{BASE}{1D}{CLP}{RCK} {TYPE}({WRMASK}){DST_HALF}{DST}{SRC1}{SRC2}{SRC3}{A1}
+ 		</display>
+ 		<field name="BASE_HI" low="19" high="20" type="uint"/>
+ 		<field name="SRC3" low="21" high="28" type="#cat5-src3">
+@@ -160,13 +162,15 @@
+ </bitset>
+ 
+ <bitset name="#instruction-cat5-tex" extends="#instruction-cat5-tex-base">
+-	<pattern pos="18">0</pattern>
++	<field name="CLP" pos="18" type="bool" display=".clp"/>
+ 	<field name="SV" pos="50" type="bool" display=".s"/>
+ 	<field name="P" pos="53" type="bool" display=".p"/>
++	<derived name="1D" expr="#false" type="bool" display=""/>
+ 
+ 	<encode>
+ 		<map name="SV">!!(src->flags &amp; IR3_INSTR_S)</map>
+ 		<map name="P">!!(src->flags &amp; IR3_INSTR_P)</map>
++		<map name="CLP">!!(src->flags &amp; IR3_INSTR_CLP)</map>
+ 	</encode>
+ </bitset>
+ 
+@@ -176,6 +180,7 @@
+ 	<derived name="HAS_SAMP" expr="#true" type="bool"/>
+ 	<derived name="HAS_TEX" expr="#true" type="bool"/>
+ 	<derived name="HAS_TYPE" expr="#true" type="bool"/>
++	<derived name="CLP" expr="#false" type="bool" display=""/>
+ 
+ 	<!-- Not sure what this field does exactly but isam.v does not work
+ 	     without it set. The blob disassembles it as .1d when not set. -->
+@@ -509,6 +514,7 @@
+ <bitset name="#instruction-cat5-brcst" extends="#instruction-cat5">
+ 	<pattern pos="18">0</pattern>
+ 	<pattern pos="50">0</pattern>
++	<derived name="CLP" expr="#false" type="bool" display=""/>
+ </bitset>
+ 
+ <bitset name="brcst.active" extends="#instruction-cat5-brcst">
+@@ -634,7 +640,7 @@
+ 
+ <bitset name="#cat5-src2" size="8">
+ 	<override>
+-		<expr>{O} || ({NUM_SRC} > 1)</expr>
++		<expr>{O} || {CLP} || ({NUM_SRC} > 1)</expr>
+ 		<display>
+ 			, {HALF}{SRC}
+ 		</display>
+@@ -736,7 +742,7 @@
+ <bitset name="#cat5-type" size="3">
+ 	<display/>
+ 	<override>
+-		<expr>{HAS_TYPE}</expr>
++		<expr>{HAS_TYPE} &amp;&amp; {TYPE} != 7</expr>
+ 		<display>
+ 			({TYPE})
+ 		</display>
+@@ -748,7 +754,9 @@
+ 			the decoded disasm, but the type field is one of those
+ 			special exceptions
+ 		 -->
+-		<map name="TYPE" force="true">src->cat5.type</map>
++		<map name="TYPE" force="true">
++			(src->flags &amp; IR3_INSTR_RCK) ? 7 : src->cat5.type
++		</map>
+ 	</encode>
+ </bitset>
+ 
+@@ -867,6 +875,10 @@
+ 	({DESC_MODE} == 3) /* CAT5_BINDLESS_A1_NONUNIFORM */ ||
+ 	({DESC_MODE} == 4) /* CAT5_NONUNIFORM */
+ </expr>
++
++<expr name="#cat5-is-rck">
++	{TYPE} == 7
++</expr>
+ 
+ <bitset name="#cat5-src3" size="8">
+ 	<doc>bindless/indirect src3, which can either be GPR or samp/tex</doc>
+Index: src/freedreno/vulkan/tu_cmd_buffer.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h	(date 1738998728671)
+@@ -150,6 +150,10 @@
+ 
+    TU_ACCESS_RTU_READ = 1 << 17,
+ 
++   /* An access through UCHE that must always be flushed/invalidated */
++   TU_ACCESS_UCHE_INCOHERENT_READ = 1 << 18,
++   TU_ACCESS_UCHE_INCOHERENT_WRITE = 1 << 19,
++
+    TU_ACCESS_READ =
+       TU_ACCESS_UCHE_READ |
+       TU_ACCESS_CCU_COLOR_READ |
+@@ -158,7 +162,8 @@
+       TU_ACCESS_CCU_DEPTH_INCOHERENT_READ |
+       TU_ACCESS_SYSMEM_READ |
+       TU_ACCESS_BINDLESS_DESCRIPTOR_READ |
+-      TU_ACCESS_CCHE_READ,
++      TU_ACCESS_CCHE_READ |
++      TU_ACCESS_UCHE_INCOHERENT_READ,
+ 
+    TU_ACCESS_WRITE =
+       TU_ACCESS_UCHE_WRITE |
+@@ -167,7 +172,8 @@
+       TU_ACCESS_CCU_DEPTH_WRITE |
+       TU_ACCESS_CCU_DEPTH_INCOHERENT_WRITE |
+       TU_ACCESS_SYSMEM_WRITE |
+-      TU_ACCESS_CP_WRITE,
++      TU_ACCESS_CP_WRITE |
++      TU_ACCESS_UCHE_INCOHERENT_WRITE,
+ 
+    TU_ACCESS_ALL =
+       TU_ACCESS_READ |
+Index: include/drm-uapi/msm_drm.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/include/drm-uapi/msm_drm.h b/include/drm-uapi/msm_drm.h
+--- a/include/drm-uapi/msm_drm.h	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/include/drm-uapi/msm_drm.h	(date 1738998728091)
+@@ -90,6 +90,33 @@
+ #define MSM_PARAM_RAYTRACING 0x11 /* RO */
+ #define MSM_PARAM_UBWC_SWIZZLE 0x12 /* RO */
+ #define MSM_PARAM_MACROTILE_MODE 0x13 /* RO */
++#define MSM_PARAM_UCHE_TRAP_BASE 0x14 /* RO */
++/* MSM_PARAM_EN_VM_BIND is set to 1 to enable VM_BIND ops.
++ *
++ * With VM_BIND enabled, userspace is required to allocate iova and use the
++ * VM_BIND ops for map/unmap ioctls.  MSM_INFO_SET_IOVA and MSM_INFO_GET_IOVA
++ * will be rejected.  (The latter does not have a sensible meaning when a BO
++ * can have multiple and/or partial mappings.)
++ *
++ * With VM_BIND enabled, userspace does not include a submit_bo table in the
++ * SUBMIT ioctl (this will be rejected), the resident set is determined by
++ * the the VM_BIND ops.
++ *
++ * Enabling VM_BIND will fail on devices which do not have per-process pgtables.
++ * And it is not allowed to disable VM_BIND once it has been enabled.
++ *
++ * Enabling VM_BIND should be done (attempted) prior to allocating any BOs or
++ * submitqueues of type MSM_SUBMITQUEUE_VM_BIND.
++ *
++ * Relatedly, when VM_BIND mode is enabled, the kernel will not try to recover
++ * from GPU faults or failed async VM_BIND ops, in particular because it is
++ * difficult to communicate to userspace which op failed so that userspace
++ * could rewind and try again.  When the VM is marked unusable, the SUBMIT
++ * ioctl will throw -EPIPE.
++ */
++#define MSM_PARAM_EN_VM_BIND 0x15  /* WO, once */
++/* PRR (Partially Resident Region) is required for sparse residency: */
++#define MSM_PARAM_HAS_PRR    0x16  /* RO */
+ 
+ /* For backwards compat.  The original support for preemption was based on
+  * a single ring per priority level so # of priority levels equals the #
+@@ -113,6 +140,19 @@
+ 
+ #define MSM_BO_SCANOUT       0x00000001     /* scanout capable */
+ #define MSM_BO_GPU_READONLY  0x00000002
++/* Private buffers do not need to be explicitly listed in the SUBMIT
++ * ioctl, unless referenced by a drm_msm_gem_submit_cmd.  Private
++ * buffers may NOT be imported/exported or used for scanout (or any
++ * other situation where buffers can be indefinitely pinned, but
++ * cases other than scanout are all kernel owned BOs which are not
++ * visible to userspace).
++ *
++ * In exchange for those constraints, all private BOs associated with
++ * a single context (drm_file) share a single dma_resv, and if there
++ * has been no eviction since the last submit, there are no per-BO
++ * bookeeping to do, significantly cutting the SUBMIT overhead.
++ */
++#define MSM_BO_NO_SHARE      0x00000004
+ #define MSM_BO_CACHE_MASK    0x000f0000
+ /* cache modes */
+ #define MSM_BO_CACHED        0x00010000
+@@ -122,6 +162,7 @@
+ 
+ #define MSM_BO_FLAGS         (MSM_BO_SCANOUT | \
+                               MSM_BO_GPU_READONLY | \
++                              MSM_BO_NO_SHARE | \
+                               MSM_BO_CACHE_MASK)
+ 
+ struct drm_msm_gem_new {
+@@ -220,7 +261,10 @@
+ 	__u32 size;           /* in, cmdstream size */
+ 	__u32 pad;
+ 	__u32 nr_relocs;      /* in, number of submit_reloc's */
+-	__u64 relocs;         /* in, ptr to array of submit_reloc's */
++	union {
++		__u64 relocs; /* in, ptr to array of submit_reloc's */
++		__u64 iova;   /* cmdstream address (for VM_BIND contexts) */
++	};
+ };
+ 
+ /* Each buffer referenced elsewhere in the cmdstream submit (ie. the
+@@ -239,6 +283,19 @@
+ #define MSM_SUBMIT_BO_DUMP             0x0004
+ #define MSM_SUBMIT_BO_NO_IMPLICIT      0x0008
+ 
++/* Map OP for MSM_SUBMIT_OP_VM_BIND/_ASYNC:
++ *  - MAP:      map a specified range of the BO into the VM
++ *  - MAP_NULL: map a NULL page into the specified range of the VM, handle
++ *              and bo_offset MBZ.  A NULL range will return zero on reads
++ *              and discard writes
++ *              see: VkPhysicalDeviceSparseProperties::residencyNonResidentStrict
++ *  - UNMAP:    unmap a specified VM range, handle and bo_offset MBZ
++ */
++#define MSM_SUBMIT_BO_OP_MASK          0xf000
++#define MSM_SUBMIT_BO_OP_MAP           0x0000
++#define MSM_SUBMIT_BO_OP_MAP_NULL      0x1000
++#define MSM_SUBMIT_BO_OP_UNMAP         0x2000
++
+ #define MSM_SUBMIT_BO_FLAGS            (MSM_SUBMIT_BO_READ | \
+ 					MSM_SUBMIT_BO_WRITE | \
+ 					MSM_SUBMIT_BO_DUMP | \
+@@ -247,7 +304,16 @@
+ struct drm_msm_gem_submit_bo {
+ 	__u32 flags;          /* in, mask of MSM_SUBMIT_BO_x */
+ 	__u32 handle;         /* in, GEM handle */
+-	__u64 presumed;       /* in/out, presumed buffer address */
++	__u64 address;        /* in/out, presumed buffer address */
++};
++
++struct drm_msm_gem_submit_bo_v2 {
++	__u32 flags;          /* in, mask of MSM_SUBMIT_BO_x */
++	__u32 handle;         /* in, GEM handle */
++	__u64 address;        /* in/out, presumed buffer address */
++	/* Remaining fields are only used with MSM_SUBMIT_OP_VM_BIND/_ASYNC: */
++	__u64 bo_offset;
++	__u64 range;
+ };
+ 
+ /* Valid submit ioctl flags: */
+@@ -258,7 +324,8 @@
+ #define MSM_SUBMIT_SYNCOBJ_IN    0x08000000 /* enable input syncobj */
+ #define MSM_SUBMIT_SYNCOBJ_OUT   0x04000000 /* enable output syncobj */
+ #define MSM_SUBMIT_FENCE_SN_IN   0x02000000 /* userspace passes in seqno fence */
+-#define MSM_SUBMIT_FLAGS                ( \
++
++#define MSM_SUBMIT_EXEC_FLAGS            ( \
+ 		MSM_SUBMIT_NO_IMPLICIT   | \
+ 		MSM_SUBMIT_FENCE_FD_IN   | \
+ 		MSM_SUBMIT_FENCE_FD_OUT  | \
+@@ -268,6 +335,13 @@
+ 		MSM_SUBMIT_FENCE_SN_IN   | \
+ 		0)
+ 
++#define MSM_SUBMIT_VM_BIND_FLAGS         ( \
++		MSM_SUBMIT_FENCE_FD_IN   | \
++		MSM_SUBMIT_FENCE_FD_OUT  | \
++		MSM_SUBMIT_SYNCOBJ_IN    | \
++		MSM_SUBMIT_SYNCOBJ_OUT   | \
++		0)
++
+ #define MSM_SUBMIT_SYNCOBJ_RESET 0x00000001 /* Reset syncobj after wait. */
+ #define MSM_SUBMIT_SYNCOBJ_FLAGS        ( \
+ 		MSM_SUBMIT_SYNCOBJ_RESET | \
+@@ -282,14 +356,17 @@
+ /* Each cmdstream submit consists of a table of buffers involved, and
+  * one or more cmdstream buffers.  This allows for conditional execution
+  * (context-restore), and IB buffers needed for per tile/bin draw cmds.
++ *
++ * For MSM_SUBMIT_VM_BIND/_ASYNC operations, the queue must have been
++ * created with the MSM_SUBMITQUEUE_VM_BIND flag.
+  */
+ struct drm_msm_gem_submit {
+ 	__u32 flags;          /* MSM_PIPE_x | MSM_SUBMIT_x */
+ 	__u32 fence;          /* out (or in with MSM_SUBMIT_FENCE_SN_IN flag) */
+ 	__u32 nr_bos;         /* in, number of submit_bo's */
+-	__u32 nr_cmds;        /* in, number of submit_cmd's */
++	__u32 nr_cmds;        /* in, number of submit_cmd's, MBZ for VM_BIND queue */
+ 	__u64 bos;            /* in, ptr to array of submit_bo's */
+-	__u64 cmds;           /* in, ptr to array of submit_cmd's */
++	__u64 cmds;           /* in, ptr to array of submit_cmd's, MBZ for VM_BIND queue */
+ 	__s32 fence_fd;       /* in/out fence fd (see MSM_SUBMIT_FENCE_FD_IN/OUT) */
+ 	__u32 queueid;        /* in, submitqueue id */
+ 	__u64 in_syncobjs;    /* in, ptr to array of drm_msm_gem_submit_syncobj */
+@@ -297,8 +374,7 @@
+ 	__u32 nr_in_syncobjs; /* in, number of entries in in_syncobj */
+ 	__u32 nr_out_syncobjs; /* in, number of entries in out_syncobj. */
+ 	__u32 syncobj_stride; /* in, stride of syncobj arrays. */
+-	__u32 pad;            /*in, reserved for future use, always 0. */
+-
++	__u32 bos_stride;     /* in, stride of bos array, if zero 16bytes used. */
+ };
+ 
+ #define MSM_WAIT_FENCE_BOOST	0x00000001
+@@ -344,12 +420,19 @@
+ /*
+  * Draw queues allow the user to set specific submission parameter. Command
+  * submissions specify a specific submitqueue to use.  ID 0 is reserved for
+- * backwards compatibility as a "default" submitqueue
++ * backwards compatibility as a "default" submitqueue.
++ *
++ * Because VM_BIND async updates happen on the CPU, they must run on a
++ * virtual queue created with the flag MSM_SUBMITQUEUE_VM_BIND.  If we had
++ * a way to do pgtable updates on the GPU, we could drop this restriction.
+  */
+ 
+ #define MSM_SUBMITQUEUE_ALLOW_PREEMPT	0x00000001
++#define MSM_SUBMITQUEUE_VM_BIND	0x00000002  /* virtual queue for VM_BIND ops */
++
+ #define MSM_SUBMITQUEUE_FLAGS		    ( \
+ 		MSM_SUBMITQUEUE_ALLOW_PREEMPT | \
++		MSM_SUBMITQUEUE_VM_BIND | \
+ 		0)
+ 
+ /*
+Index: src/freedreno/vulkan/tu_knl.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+--- a/src/freedreno/vulkan/tu_knl.h	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_knl.h	(date 1738998728736)
+@@ -11,6 +11,7 @@
+ #define TU_DRM_H
+ 
+ #include "tu_common.h"
++#include "tu_queue.h"
+ 
+ struct tu_u_trace_syncobj;
+ struct vdrm_bo;
+@@ -80,6 +81,40 @@
+    struct vk_object_base *base;
+ };
+ 
++enum tu_sparse_vma_flags {
++   TU_SPARSE_VMA_REPLAYABLE = 1 << 0,
++   TU_SPARSE_VMA_MAP_ZERO = 1 << 1,
++};
++
++/* This represents a memory region into which BOs can be mapped. This is
++ * implemented differently on drm/msm and kgsl:
++ *
++ * - msm allows us to control the VA range ourselves, and provides an API to
++ *   map/unmap arbitrary parts of BOs to a given VA range. The sparse VMA is
++ *   just a userspace driver abstraction, consisting of an iova range we
++ *   reserve and map as NULL initially. For sparse BOs, we simply don't
++ *   reserve an iova range and map/unmap them when creating them.
++ * - kgsl doesn't allow userspace control of the iova, and requires that we
++ *   create a "virtual BO" into which we can map sparse BOs. The virtual BO
++ *   maps almost one-to-one to a Vulkan VkBuffer or VkImage with sparse
++ *   binding.
++ *
++ * tu_sparse_vma is an abstraction to bridge this difference.
++ */
++struct tu_sparse_vma {
++   enum tu_sparse_vma_flags flags;
++
++   union {
++      struct {
++         uint64_t iova;
++         uint64_t size;
++      } msm;
++      struct {
++         struct tu_bo *virtual_bo;
++      } kgsl;
++   };
++};
++
+ struct tu_knl {
+    const char *name;
+ 
+@@ -88,7 +123,7 @@
+    int (*device_get_gpu_timestamp)(struct tu_device *dev, uint64_t *ts);
+    int (*device_get_suspend_count)(struct tu_device *dev, uint64_t *suspend_count);
+    VkResult (*device_check_status)(struct tu_device *dev);
+-   int (*submitqueue_new)(struct tu_device *dev, int priority, uint32_t *queue_id);
++   int (*submitqueue_new)(struct tu_device *dev, enum tu_queue_type type, int priority, uint32_t *queue_id);
+    void (*submitqueue_close)(struct tu_device *dev, uint32_t queue_id);
+    VkResult (*bo_init)(struct tu_device *dev, struct vk_object_base *base,
+                        struct tu_bo **out_bo, uint64_t size, uint64_t client_iova,
+@@ -109,12 +144,25 @@
+    void (*submit_add_entries)(struct tu_device *device, void *_submit,
+                               struct tu_cs_entry *entries,
+                               unsigned num_entries);
++   void (*submit_add_bind)(struct tu_device *device,
++                           void *_submit,
++                           struct tu_sparse_vma *vma, uint64_t vma_offset,
++                           struct tu_bo *bo, uint64_t bo_offset,
++                           uint64_t size);
+    VkResult (*queue_submit)(struct tu_queue *queue, void *_submit,
+                             struct vk_sync_wait *waits, uint32_t wait_count,
+                             struct vk_sync_signal *signals, uint32_t signal_count,
+                             struct tu_u_trace_submission_data *u_trace_submission_data);
+    VkResult (*queue_wait_fence)(struct tu_queue *queue, uint32_t fence,
+                                 uint64_t timeout_ns);
++   VkResult (*sparse_vma_init)(struct tu_device *dev,
++                               struct vk_object_base *base,
++                               struct tu_sparse_vma *out_vma,
++                               uint64_t *out_iova,
++                               enum tu_sparse_vma_flags flags,
++                               uint64_t size, uint64_t client_iova);
++   void (*sparse_vma_finish)(struct tu_device *device,
++                             struct tu_sparse_vma *vma);
+ 
+    const struct vk_device_entrypoint_table *device_entrypoints;
+ };
+@@ -202,6 +250,16 @@
+    return bo;
+ }
+ 
++VkResult tu_sparse_vma_init(struct tu_device *dev,
++                            struct vk_object_base *base,
++                            struct tu_sparse_vma *out_vma,
++                            uint64_t *out_iova,
++                            enum tu_sparse_vma_flags flags,
++                            uint64_t size, uint64_t client_iova);
++
++void tu_sparse_vma_finish(struct tu_device *device,
++                          struct tu_sparse_vma *vma);
++
+ VkResult tu_knl_kgsl_load(struct tu_instance *instance, int fd);
+ 
+ struct _drmVersion;
+@@ -241,6 +299,7 @@
+ 
+ int
+ tu_drm_submitqueue_new(struct tu_device *dev,
++                       enum tu_queue_type type,
+                        int priority,
+                        uint32_t *queue_id);
+ 
+@@ -258,6 +317,13 @@
+                       struct tu_cs_entry *entries,
+                       unsigned num_entries);
+ 
++void
++tu_submit_add_bind(struct tu_device *device,
++                   void *_submit,
++                   struct tu_sparse_vma *vma, uint64_t vma_offset,
++                   struct tu_bo *bo, uint64_t bo_offset,
++                   uint64_t size);
++
+ VkResult
+ tu_queue_submit(struct tu_queue *queue, void *submit,
+                 struct vk_sync_wait *waits, uint32_t wait_count,
+Index: src/freedreno/ir3/ir3_image.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/ir3/ir3_image.c b/src/freedreno/ir3/ir3_image.c
+--- a/src/freedreno/ir3/ir3_image.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/ir3/ir3_image.c	(date 1738998728545)
+@@ -102,7 +102,9 @@
+    nir_alu_type type = nir_type_uint;
+    switch (instr->intrinsic) {
+    case nir_intrinsic_image_load:
++   case nir_intrinsic_image_sparse_load:
+    case nir_intrinsic_bindless_image_load:
++   case nir_intrinsic_bindless_image_sparse_load:
+       type = nir_alu_type_get_base_type(nir_intrinsic_dest_type(instr));
+       /* SpvOpAtomicLoad doesn't have dest type */
+       if (type == nir_type_invalid)
+Index: src/freedreno/vulkan/tu_clear_blit.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+--- a/src/freedreno/vulkan/tu_clear_blit.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_clear_blit.cc	(date 1738998728640)
+@@ -2932,7 +2932,8 @@
+                   1,
+                   layer_count,
+                   extent.depth > 1,
+-                  false,
++                  false, /* is_mutable */
++                  false, /* sparse */
+                   NULL);
+ 
+       struct tu_bo *staging_bo;
+Index: src/freedreno/ir3/tests/disasm.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/ir3/tests/disasm.c b/src/freedreno/ir3/tests/disasm.c
+--- a/src/freedreno/ir3/tests/disasm.c	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/ir3/tests/disasm.c	(date 1738998728500)
+@@ -187,6 +187,9 @@
+ 
+    INSTR_6XX(a7000000_00000000, "tcinv"),
+ 
++   /* custom */
++   INSTR_6XX(a0c07f04_0cc00005, "sam.rck (xyzw)r1.x, r0.z, s#6, t#6"),
++
+    /* cat6 */
+ 
+    INSTR_5XX(c6e60000_00010600, "ldgb.untyped.4d.u32.1 r0.x, g[0], r1.x, r0.x"), /* ldgb.a.untyped.1dtype.u32.1 r0.x, g[r1.x], r0.x, 0 */
+@@ -286,6 +289,8 @@
+    INSTR_7XX(c3260002_01e1b100, "ldib.b.untyped.1d.u32.4.imm.base0 r0.z, r0.y+12, 0"),
+    INSTR_7XX(c7661840_4de74144, "stib.b.untyped.1d.u32.1.uniform.base2 r16.x, r19.y+29, r3.x"),
+ 
++   INSTR_6XX(c0260d0a_0a61b180, "ldib.b.untyped.1d.u32.rck.4.nonuniform.base0 r2.z, r2.z, r1.z"),
++
+    /* dEQP-GLES31.functional.tessellation.invariance.outer_edge_symmetry.isolines_equal_spacing_ccw */
+    INSTR_6XX(c2c21100_04800006, "stlw.f32 l[r2.x], r0.w, 4"),
+    INSTR_6XX(c2c20f00_01800004, "stlw.f32 l[r1.w], r0.z, 1"),
+@@ -442,6 +447,9 @@
+    /* dEQP-GLES31.functional.shaders.opaque_type_indexing.sampler.const_literal.fragment.sampler2d */
+    INSTR_6XX(a0c01f04_0cc00005, "sam (f32)(xyzw)r1.x, r0.z, s#6, t#6"),
+ 
++   /* custom */
++   INSTR_6XX(a0c01f04_0cc40005, "sam.clp (f32)(xyzw)r1.x, r0.z, r0.x, s#6, t#6"),
++
+    /* dEQP-GLES31.functional.shaders.opaque_type_indexing.sampler.uniform.fragment.sampler2d */
+    INSTR_4XX(a0c81f02_00800001, "sam.s2en.uniform (f32)(xyzw)r0.z, r0.x, hr1.x"), /* sam.s2en.mode0 (f32)(xyzw)r0.z, r0.x, hr1.x */ /* same for 5xx */
+    INSTR_6XX(a0c81f07_0100000b, "sam.s2en.uniform (f32)(xyzw)r1.w, r1.y, hr2.x"), /* sam.s2en.mode0 (f32)(xyzw)r1.w, r1.y, hr2.x */
+@@ -450,6 +458,9 @@
+    INSTR_4XX(a0c81f02_80800001, "sam.s2en.nonuniform (f32)(xyzw)r0.z, r0.x, hr1.x"), /* sam.s2en.uniform (f32)(xyzw)r0.z, r0.x, hr1.x */ /* same for 5xx */
+    INSTR_6XX(a0c81f07_8100000b, "sam.s2en.nonuniform (f32)(xyzw)r1.w, r1.y, hr2.x"), /* sam.s2en.mode4 (f32)(xyzw)r1.w, r1.y, hr2.x */
+ 
++   /* custom */
++   INSTR_6XX(a1083f06_c0240805, "samb.base0.clp (u32)(xyzw)r1.z, r0.z, r1.x, s#1, t#0"), /* sam.s2en.mode4.clp (f32)(xyzw)r1.w, r1.y, hr2.x */
++
+    /* NonUniform: */
+    /* dEQP-VK.descriptor_indexing.storage_buffer */
+    INSTR_6XX(c0260c0a_0a61b180, "ldib.b.untyped.1d.u32.4.nonuniform.base0 r2.z, r2.z, r1.z"),
+Index: src/freedreno/vulkan/tu_knl_drm_virtio.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/freedreno/vulkan/tu_knl_drm_virtio.cc b/src/freedreno/vulkan/tu_knl_drm_virtio.cc
+--- a/src/freedreno/vulkan/tu_knl_drm_virtio.cc	(revision 98ffbc0e373ac3fe7cd957a005318ce7ba90bc8e)
++++ b/src/freedreno/vulkan/tu_knl_drm_virtio.cc	(date 1738998728769)
+@@ -340,6 +340,7 @@
+ 
+ static int
+ virtio_submitqueue_new(struct tu_device *dev,
++                       enum tu_queue_type type,
+                        int priority,
+                        uint32_t *queue_id)
+ {
+@@ -347,9 +348,10 @@
+           priority < dev->physical_device->submitqueue_priority_count);
+ 
+    struct drm_msm_submitqueue req = {
+-      .flags = dev->physical_device->info->chip >= 7 &&
+-         dev->physical_device->has_preemption ?
+-         MSM_SUBMITQUEUE_ALLOW_PREEMPT : 0,
++      .flags = type == TU_QUEUE_SPARSE ? MSM_SUBMITQUEUE_VM_BIND :
++         (dev->physical_device->info->chip >= 7 &&
++          dev->physical_device->has_preemption ?
++          MSM_SUBMITQUEUE_ALLOW_PREEMPT : 0),
+       .prio = priority,
+    };
+ 
+@@ -594,7 +596,7 @@
+       .flags = MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE |
+                COND(dump, MSM_SUBMIT_BO_DUMP),
+       .handle = bo->res_id,
+-      .presumed = iova,
++      .address = iova,
+    };
+ 
+    *bo = (struct tu_bo) {
+@@ -850,6 +852,32 @@
+    mtx_unlock(&dev->bo_mutex);
+ }
+ 
++static void
++virtio_bo_finish(struct tu_device *dev, struct tu_bo *bo)
++{
++   assert(bo->gem_handle);
++
++   u_rwlock_rdlock(&dev->dma_bo_lock);
++
++   if (!p_atomic_dec_zero(&bo->refcnt)) {
++      u_rwlock_rdunlock(&dev->dma_bo_lock);
++      return;
++   }
++
++   if (bo->map)
++      munmap(bo->map, bo->size);
++
++   tu_debug_bos_del(dev, bo);
++   tu_dump_bo_del(dev, bo);
++
++   tu_bo_list_del(dev, bo);
++
++   assert(dev->physical_device->has_set_iova);
++   tu_bo_make_zombie(dev, bo);
++
++   u_rwlock_rdunlock(&dev->dma_bo_lock);
++}
++
+ static VkResult
+ setup_fence_cmds(struct tu_device *dev)
+ {
+@@ -1116,7 +1144,7 @@
+       .bo_export_dmabuf = tu_drm_export_dmabuf,
+       .bo_map = virtio_bo_map,
+       .bo_allow_dump = virtio_bo_allow_dump,
+-      .bo_finish = tu_drm_bo_finish,
++      .bo_finish = virtio_bo_finish,
+       .submit_create = msm_submit_create,
+       .submit_finish = msm_submit_finish,
+       .submit_add_entries = msm_submit_add_entries,

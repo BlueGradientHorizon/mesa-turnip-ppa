@@ -6,7 +6,7 @@ patches=(
 	#"descr-prefetching-optimization-a7xx;merge_requests/29873;"
 	#"make-gmem-work-with-preemption;merge_requests/29871;"
 	#"VK_EXT_fragment_density_map;merge_requests/29938;"
- 	"sparse-residency-support;../../../sparse-residency-support.patch"
+ 	"sparse-residency-support;../../../turnip-patches/sparse-residency-support.patch"
 )
 export DEBEMAIL="${EMAIL}"
 export DEBFULLNAME="BGHorizon"

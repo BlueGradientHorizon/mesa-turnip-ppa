@@ -20,15 +20,24 @@ install_dev() {
 		echo 'dev packages already installed'
 	fi
 }
+gpg_agent_preset() {
+	local keygrip=$(gpg-connect-agent -q 'keyinfo --list' /bye | awk '/KEYINFO/ { print $3 }')
+	local k
+	for k in $keygrip
+	do
+		echo "${PASSPHRASE}" | /usr/lib/gnupg2/gpg-preset-passphrase --preset $k
+	done
+}
 sudo apt update
 sudo apt -y upgrade
 sudo apt -y full-upgrade
 sudo apt install -y software-properties-common git
 export GPG_TTY="/dev/null"
 echo "${PUBKEY}" | base64 --decode | gpg --batch --import
-echo "${PRIVKEY}" | base64 --decode | gpg --batch --pinentry-mode loopback --passphrase "${PASSPHRASE}" --import 
+echo "${PRIVKEY}" | base64 --decode | gpg --batch --import 
 git config --global user.email "${EMAIL}"
 git config --global user.name "BlueGradientHorizon"
+gpg_agent_preset
 sudo add-apt-repository -n -y ppa:oibaf/graphics-drivers
 sudo add-apt-repository -n -y ppa:bghorizon/mesa-turnip-kgsl
 sudo sed -i 's/^Types: deb$/Types: deb deb-src/g' /etc/apt/sources.list.d/oibaf-*.sources

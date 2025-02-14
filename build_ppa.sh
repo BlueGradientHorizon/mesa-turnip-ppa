@@ -21,6 +21,8 @@ install_dev() {
 	fi
 }
 gpg_agent_preset() {
+	echo allow-preset-passphrase >> ~/.gnupg/gpg-agent.conf
+ 	gpg-connect-agent reloadagent /bye
 	local keygrip=$(gpg-connect-agent -q 'keyinfo --list' /bye | awk '/KEYINFO/ { print $3 }')
 	local k
 	for k in $keygrip

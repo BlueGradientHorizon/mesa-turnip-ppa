@@ -9,7 +9,7 @@ patches=(
  	"sparse-residency-support;../../../turnip-patches/sparse-residency-support.patch"
 )
 export DEBEMAIL="${EMAIL}"
-export DEBFULLNAME="BGHorizon"
+export DEBFULLNAME="BlueGradientHorizon"
 install_dev() {
 	if [ ! -e .devready ]
 	then

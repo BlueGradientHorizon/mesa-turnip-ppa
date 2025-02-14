@@ -24,6 +24,7 @@ sudo apt update
 sudo apt -y upgrade
 sudo apt -y full-upgrade
 sudo apt install -y software-properties-common git
+echo "tty=${tty}"
 export GPG_TTY=$(tty)
 echo "${PUBKEY}" | base64 --decode | gpg --batch --import
 echo "${PRIVKEY}" | base64 --decode | gpg --batch --pinentry-mode loopback --passphrase "${PASSPHRASE}" --import 

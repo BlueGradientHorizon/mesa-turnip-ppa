@@ -33,6 +33,7 @@ jobs:
           EMAIL: ${{ secrets.EMAIL }}
           PUBKEY: ${{ secrets.PUBKEY }}
           PRIVKEY: ${{ secrets.PRIVKEY }}
+          PASSPHRASE: ${{ secrets.PASSPHRASE }}
         run: |
           cd "$GITHUB_WORKSPACE"
           podman build -f Dockerfile -t turnip-build --build-arg EMAIL="$EMAIL" --build-arg PRIVKEY="$PRIVKEY" --build-arg PUBKEY="$PUBKEY" --build-arg PASSPHRASE="$PASSPHRASE" --build-arg UBUNTU_VERSION="24.04"
@@ -43,6 +44,7 @@ jobs:
           EMAIL: ${{ secrets.EMAIL }}
           PUBKEY: ${{ secrets.PUBKEY }}
           PRIVKEY: ${{ secrets.PRIVKEY }}
+          PASSPHRASE: ${{ secrets.PASSPHRASE }}
         run: |
           cd "$GITHUB_WORKSPACE"
           podman build -f Dockerfile -t turnip-build --build-arg EMAIL="$EMAIL" --build-arg PRIVKEY="$PRIVKEY" --build-arg PUBKEY="$PUBKEY" --build-arg PASSPHRASE="$PASSPHRASE" --build-arg UBUNTU_VERSION="24.10"

@@ -19,7 +19,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ubuntu_version: ["20.04", "22.04", "24.04", "24.10", "25.04"]
+        # ppa:oibaf/graphics-drivers publishes libs and packages for Ubuntu 24.04 and later 
+        ubuntu_version: ["24.04", "24.10", "25.04"]
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
